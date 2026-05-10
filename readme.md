@@ -5,6 +5,8 @@
 ---
 
 ## 📖 도서 정보
+<img width="458" height="588" alt="image" src="https://github.com/user-attachments/assets/df1d145c-a0f6-4358-b1dd-d229d32e9dd3" />
+
 - **도서명**: 데이터 엔지니어링 디자인 패턴
 - **주요 내용**: 10개 장에 걸친 70가지 데이터 엔지니어링 디자인 패턴 상세 분석
 
