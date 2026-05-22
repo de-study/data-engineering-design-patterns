@@ -14,7 +14,11 @@
    - 패턴 #11: 지연 데이터 탐지기 (Late Data Detector)
    - 패턴 #12: 정적 지연 데이터 통합기 (Static Late Data Integrator)
    - 패턴 #13: 동적 지연 데이터 통합기 (Dynamic Late Data Integrator)
-4. [요약](#4-요약)
+4. [필터링 (Filtering)](#4-필터링-filtering)
+   - 패턴 #14: 필터 인터셉터 (Filter Interceptor)
+5. [내결함성 (Fault Tolerance)](#5-내결함성-fault-tolerance)
+   - 패턴 #15: 체크포인터 (Checkpointer)
+6. [요약](#6-요약)
 
 ---
 
@@ -813,55 +817,366 @@ with DAG('devices_loader', max_active_runs=5,
 
 ---
 
-## 4. 요약
+## 4. 필터링 (Filtering)
+
+데이터 엔지니어링에서 "오류" 가 항상 기술적 실패만을 의미하지는 않음.
+잘못 구현된 필터처럼 사람이 만들어내는 실수도 오류 — 사용자에게 부분/잘못된 데이터가 노출됨.
+필터링 자체는 가장 흔한 데이터 연산이지만, **어떤 필터 조건이 얼마나 많은 행을 제거했는가** 를 모르면
+"공격적 필터 / 버그성 필터" 같은 실수를 감지할 수 없음.
+
+### 4-1. 패턴 #14: 필터 인터셉터 (Filter Interceptor)
+
+각 필터 조건에 카운터를 부착해 "이 조건이 몇 건을 걸러냈는지" 를 추적하는 패턴.
+
+#### 상황 (Problem)
+
+**책의 use case:**
+- 분산 데이터 처리 프레임워크 기반 배치 잡 운영 중.
+- 최근 새 버전 배포 후 **필터링된 데이터 비중이 15% → 90%** 로 갑자기 폭증.
+- 데이터 회귀인지 코드 회귀인지 판별이 필요한데, 실행 계획만 봐서는 알 수 없음.
+  → 프레임워크가 최적화 단계에서 **여러 필터 표현식을 하나로 합쳐버리기 (filter collapsing)** 때문에,
+   실행 계획에는 합쳐진 단일 필터의 통계만 남음.
+- **결정적 제약**: 각 필터 조건별로 "얼마나 많은 행이 제거됐는지" 를 **분리해서** 관측할 수 있어야 회귀 원인을 추적 가능.
+
+#### 해결 (Solution)
+
+이상적으로는 물리 실행 계획 분석이 정답이지만, 위 collapsing 최적화 때문에 정확도가 떨어짐.
+Filter Interceptor 는 **필터 조건을 카운터 로직으로 래핑** 해서 "조건이 false 로 평가될 때마다 카운터를 증가" 시킴.
+잡 종료 후 모든 카운터를 명시적으로 수집해 필터별 영향을 측정.
+
+구현 방식은 언어에 따라 다름:
+- **프로그래밍 API (Spark Scala/PySpark)**: 상대적으로 단순. `Accumulator` 같은 분산 카운터로 필터 함수를 래핑.
+- **선언형 언어 (SQL)**: 더 복잡. 서브쿼리 또는 임시 테이블로 각 필터 조건을 **별도 컬럼** 으로 노출
+  (예: `a IS NOT NULL` → `a_is_not_null` 컬럼). 그 컬럼을 메인 쿼리에서 필터 predicate 로 재사용.
+
+> **사이드바 — Stay Pragmatic**
+> "쓸 도구를 골라라." 지금까지 SQL 만 써 왔다고 해서 프로그래밍 API 를 회피할 이유는 없음.
+> 반대도 마찬가지. Filter Interceptor 같은 패턴은 프로그래밍 API 가 훨씬 자연스러움.
+
+```
+필터 카운터 래핑 동작
+--------------------------------------------------------------
+[입력 레코드]
+     │
+     ▼
+[filter A: type IS NOT NULL]
+     ├─► True  → 다음 필터로
+     └─► False → counter_A += 1, drop
+                       │
+                       ▼
+              [filter B: LEN(type) > 1]
+                       ├─► True  → 통과
+                       └─► False → counter_B += 1, drop
+
+[잡 종료] ── 모든 카운터 수집
+              counter_A = 150,000  (전체의 65%)
+              counter_B = 30,000   (전체의 13%)
+              → "필터 A 가 가장 많이 걸러냄" 을 즉시 식별
+--------------------------------------------------------------
+```
+
+#### 고려사항 (Consequences)
+
+패턴이 잡 동작에 관한 추가 통찰을 주지만, 공짜는 아님.
+
+**Runtime impact — 실행 시간/자원 비용**
+- 카운터 자료구조는 task-local 에서 단순히 누적되고 마지막에 네트워크로 모이는 수준 → 프로그래밍 API 에서는 거의 무시 가능한 비용.
+- SQL 구현은 임시 테이블/서브쿼리를 만들고 두 번에 걸쳐 같은 데이터를 훑어야 하므로 비용이 더 큼.
+
+**Declarative languages — SQL 의 한계**
+- SQL 만으로 같은 패턴을 구현해도 verbose 하고 유지보수가 어려움.
+- 프로그래밍 API 가 표현력·유지보수 모두 유리. 도구 선택을 도그마로 하지 말 것.
+
+**Streaming — 무한 데이터 처리에서의 어려움**
+- 스트리밍에서는 stateless 잡을 stateful 로 바꿔야 카운터를 유지할 수 있음 → 추가 상태 관리 비용.
+- 데이터가 끝없이 들어오므로 통계도 시간 boundary 필요. 예: processing-time 기반 윈도우로 "최근 10분 동안의 필터 통계" 를 노출해야 현재 시점과 연관 지을 수 있음.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Apache Spark PySpark (Accumulator + mapInPandas)**
+
+필터 조건과 Spark Accumulator 를 묶은 `FilterWithAccumulator` 래퍼 클래스를 정의:
+```python
+# (1) 필터 + 카운터를 함께 보관하는 데이터클래스
+@dataclasses.dataclass
+class FilterWithAccumulator:
+    name: str
+    filter: Callable[[Any], bool]
+    accumulator: Accumulator[int]
+
+# (2) 컬럼별로 적용할 필터들을 누적기와 함께 정의
+filters_with_accumulators = {
+    'type': [
+      FilterWithAccumulator('type is null',
+        lambda device: device['type'] is not None,
+        spark_context.accumulator(0)),
+      FilterWithAccumulator('type is too short (1 chars or less)',
+        lambda device: len(device['type']) > 1,
+        spark_context.accumulator(0))
+    ],
+    # ...
+}
+```
+
+이후 `mapInPandas` 변환에서 각 row 마다 모든 필터를 평가하고, false 인 경우 누적기를 증가:
+```python
+def filter_null_type(devices_iterator: Iterator[pandas.DataFrame]):
+    def filter_row_with_accumulator(device_row):
+        for device_row_attribute in device_row.keys():
+            for filter_with_accumulator in filters_with_accumulators[device_row_attribute]:
+                if not filter_with_accumulator.filter(device_row):
+                    filter_with_accumulator.accumulator.add(1)   # 실패한 필터의 카운터 +1
+                    return False
+        return True
+
+    for devices_df in devices_iterator:
+        yield devices_df[devices_df.apply(
+            lambda device: filter_row_with_accumulator(device), axis=1) == True]
+
+valid_devices = input_dataset.mapInPandas(filter_null_type, input_dataset.schema)
+valid_devices.write.mode('append').format('delta').save(output_dir)
+
+# (3) 잡 종료 후 누적기 값을 읽어 필터별 통계 출력
+for key, accumulators in filters_with_accumulators.items():
+    for accumulator_with_filter in accumulators:
+        print(f'{key} // {accumulator_with_filter.name} // {accumulator_with_filter.accumulator.value}')
+```
+
+**예시 2 — Spark SQL (status_flag 컬럼으로 분기)**
+
+선언형이라 임시 뷰를 거쳐야 함 — 1단계 status_flag 계산, 2단계 통계 집계 / 유효 데이터 분리:
+```python
+# (1) 각 필터가 어떤 status_flag 를 남기는지 case 로 인코딩
+spark_session.sql('''SELECT * FROM (
+   SELECT
+     CASE
+       WHEN (type IS NOT NULL) IS FALSE THEN 'null_type'
+       WHEN (LEN(type) > 2) IS FALSE THEN 'short_type'
+       WHEN (full_name IS NOT NULL) IS FALSE THEN 'null_full_name'
+       WHEN (version IS NOT NULL) IS FALSE THEN 'null_version'
+       ELSE NULL
+     END AS status_flag,
+     type, full_name, version
+   FROM input)''').createTempView('input_with_flags')
+
+# (2) 어떤 status_flag 가 가장 많이 걸렸는지 집계 (통계 테이블)
+spark_session.sql('''SELECT COUNT(*), status_flag FROM input_with_flags
+  WHERE status_flag IS NOT NULL GROUP BY status_flag''').createTempView('grouped_filters')
+
+# (3) status_flag 가 NULL 인 행만 valid 로 저장
+(spark_session.sql('SELECT type, full_name, version FROM input_with_flags '
+                   'WHERE status_flag IS NULL')
+ .write.mode('append').format('delta').save(f'{base_dir}/devices-valid-sql-table'))
+```
+
+| 구현 방식 | 동작 | 주의사항 |
+|----------|------|----------|
+| Spark Accumulator | task-local 카운터 → driver 에 집계 | accumulator 값은 task 재시도 시 중복 카운트될 수 있음 (action 단위에서만 정확) |
+| Spark SQL `status_flag` | 한 컬럼에 어떤 필터가 걸렸는지 case 로 인코딩 | 한 행은 가장 먼저 매칭된 필터에만 카운트됨 → "여러 조건 동시 실패" 통계는 별도 설계 필요 |
+| 스트리밍 (stateful + 윈도우) | 시간 윈도우 기반으로 필터 통계 노출 | stateless → stateful 전환 비용 + state store 관리 부담 |
+
+> **트러블 로그** — Filter Interceptor 없이 운영 중인 ETL 에서 필터 통과율이 갑자기 떨어지면 원인 추적에 며칠이 걸림.
+> 예: 배포 직후 디바이스 ingest 잡의 valid 비율이 평소 85% → 10% 로 떨어졌는데, 코드에는 `type IS NOT NULL`,
+> `LEN(type) > 1`, `version IS NOT NULL` 등 5개 필터가 한 줄로 묶여 있고 Spark 실행 계획에는 합쳐진 단일 필터의
+> "filtered rows = 9M" 통계만 남음. 원인이 새로 도입된 `type` 컬럼 표준화 로직(소문자 변환 후 trim) 이 빈 문자열을
+> 양산하고 있다는 사실을 발견하는 데 3일 소요. Accumulator 로 필터별 카운터를 운영했다면 배포 5분 내에
+> `LEN(type) > 1` 만 폭증한 것을 보고 즉시 원인을 좁힐 수 있음.
+> **필터를 두 개 이상 묶는 곳에는 반드시 필터별 카운터를 부착하고, 카운터 값을 메트릭으로 export 할 것.**
+
+---
+
+## 5. 내결함성 (Fault Tolerance)
+
+이 챕터의 마지막 패턴은 **연속적인 처리 워크플로우 (특히 스트리밍)** 의 복구 가능성을 보장하는 도구.
+스트리밍 잡의 가장 큰 어려움은 "잡이 죽었다 다시 살아났을 때 어디서부터 다시 시작해야 하는가" —
+적절한 진행 추적 메커니즘이 없으면 이미 처리한 데이터를 다시 처리하게 됨.
+
+### 5-1. 패턴 #15: 체크포인터 (Checkpointer)
+
+소스의 읽기 위치와 계산된 state 를 영속 저장소에 주기적으로 기록해, 재시작 시 정확히 그 지점부터 이어서 처리하도록 만드는 패턴.
+
+#### 상황 (Problem)
+
+**책의 use case:**
+- 스트리밍 잡이 visit 이벤트를 처리하며 **10분 윈도우** 단위로 unique 방문 수를 집계 중.
+- 어떤 fatal failure 가 발생하면 잡이 멈추고 "처음부터" 재처리할 위험 → 비용·지연 폭증.
+- **결정적 제약**: 스트리밍은 append-only 로그에서 끝없이 들어오는 이벤트를 다루므로, 배치처럼 단순 재시작 불가.
+  데이터셋에 명시적인 파티션 같은 조직 구조가 없어 "어디까지 했는지" 외부 기록이 없으면 알 길이 없음.
+
+#### 해결 (Solution)
+
+**진행 정보를 잡 환경보다 영속적인 저장소에 기록** 하는 것이 핵심 — 잡을 재시작하면 환경(메모리·로컬 디스크) 은 사라지지만,
+영속 저장소의 체크포인트는 남아 있음.
+
+진행 정보를 어디에 두는가에 따라 두 갈래:
+- **Data processing framework based** — 프레임워크가 자체적으로 영속 객체 저장소에 메타데이터를 관리.
+  대표 사례: Apache Spark Structured Streaming, Apache Flink (offset + state 모두 관리).
+- **Data store based** — 데이터스토어 SDK 가 체크포인트를 직접 다룸.
+  대표 사례: Kafka SDK (`__consumer_offsets` 토픽), Amazon Kinesis Client Library (DynamoDB 테이블).
+
+체크포인트 실행 방식에 따라 또 두 갈래:
+- **Configuration-driven** — 빈도만 설정, 실행은 라이브러리가 알아서. Spark/Flink 가 이 모델.
+- **Intentional checkpoint** — 코드에서 "여기까지 처리했음" 을 명시적으로 commit. Kafka 커스텀 컨슈머의 `commit()` 호출이 대표.
+
+```
+체크포인터 동작 (Spark Structured Streaming 기준)
+--------------------------------------------------------------
+[Source (Kafka topic)]
+       │
+       ▼
+[micro-batch N 처리]            [윈도우 집계 state (RocksDB/메모리)]
+       │                                  │
+       └────────────┬─────────────────────┘
+                    ▼
+       [checkpointLocation 에 메타데이터 영속화]
+                    │
+       ┌────────────┼─────────────────┐
+       ▼            ▼                 ▼
+  offsets/{N}   state/{N}/...     commits/{N}
+  (이 배치가     (집계 키별         (이 배치가
+   어디부터       누적 카운트        정상 완료
+   어디까지       /상태 스냅샷)      됐는지 마커)
+   읽었나)
+
+  재시작 시 → 마지막 `commits/{N}` 마커 확인
+              → `offsets/{N}` 으로 소스 재구성
+              → `state/{N}` 으로 상태 복구
+              → 다음 배치 N+1 부터 정확히 이어서 처리
+--------------------------------------------------------------
+
+체크포인트 빈도 트레이드오프:
+- 잦은 체크포인트  → 잡 느려짐 + 메타데이터 I/O 비용 ↑
+                    실패 시 재처리 양은 적음
+- 드문 체크포인트  → 잡 빠름
+                    실패 시 마지막 체크포인트 ~ 실패 시점 사이 전부 재처리
+```
+
+#### 고려사항 (Consequences)
+
+추가 내결함성을 얻는 대가로 비용이 따름. 가장 큰 손해는 latency.
+
+**Delivery guarantee vs latency trade-off — 빈도와 비용의 균형**
+- 위치 추적 자체는 가벼움 (파티션당 숫자 몇 개만 메모리에 모은 뒤 가끔 영속화).
+- 그러나 stateful 잡 (예: Stateful Sessionizer) 은 state 도 함께 체크포인트되므로 훨씬 무거움.
+- 잦은 체크포인트는 잡 처리량을 떨어뜨리고, 드문 체크포인트는 실패 시 재처리량을 늘림 — 둘 사이 균형을 운영 SLA 에 맞춰 정해야 함.
+
+**Exactly-once feeling — 진짜 exactly-once 가 아님**
+- 분산 환경의 비동기 특성상, 여러 task 가 병렬로 작업 중일 때 일부가 체크포인트 직전에 실패하면 재시도가 발생 → 이미 성공한 작업의 일부도 재처리됨.
+- 즉 Checkpointer 는 "exactly-once 같은 느낌" 만 줄 뿐 진짜 exactly-once 가 아님.
+- 진짜 exactly-once 전달은 Chapter 4 의 **idempotency 패턴** 이 추가로 필요.
+
+**Delivery modes — 체크포인트 타이밍이 delivery 의미를 결정**
+- **Exactly once**: 프로듀서가 단 한 번만 전달 (idempotency 와 결합돼야 가능, Chapter 4).
+- **At least once**: 처리 후 체크포인트 → 재시도 시 같은 데이터가 다시 들어와 중복 가능.
+- **At most once**: 처리 전 체크포인트 → 처리 중 실패 시 데이터 손실.
+- 즉, 같은 Checkpointer 라도 "체크포인트를 처리 전·후 어느 시점에 찍는가" 가 의미를 바꿈.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Apache Spark Structured Streaming (configuration-driven)**
+
+`checkpointLocation` 옵션만 주면 Spark 가 micro-batch 단위로 offset/state/commit 을 자동 기록:
+```python
+write_query = (input_stream_data.writeStream.outputMode('update')
+    .option('checkpointLocation', f'{base_dir}/checkpoint')   # 체크포인트 위치만 지정
+    .foreachBatch(synchronize_visits_to_files).start())
+```
+
+저장되는 메타데이터 예시 (`{checkpoint}/offsets/18`):
+```
+{"visits":{"1":1276,"0":1224}}   # 파티션 0/1 의 마지막 처리 오프셋
+```
+
+**예시 2 — Apache Flink (time-based + retain on cancellation)**
+
+Flink 는 micro-batch 가 아니라 시간 기반으로 체크포인트를 트리거:
+```python
+checkpoint_interval_30_sec = 30000
+env.enable_checkpointing(checkpoint_interval_30_sec, mode=EXACTLY_ONCE)
+
+# 잡 취소/실패 시에도 체크포인트 파일을 남겨두도록 설정 (기본은 종료 시 삭제)
+(env.get_checkpoint_config().enable_externalized_checkpoints(RETAIN_ON_CANCELLATION))
+```
+
+- `EXACTLY_ONCE` 모드: 윈도우 카운터 같은 stateful 연산이 재시작 후에도 한 번만 반영되도록 보장.
+- `RETAIN_ON_CANCELLATION`: 기본값은 잡 종료 시 체크포인트 삭제 → 이 옵션을 켜야 재시작 시 복구 가능.
+
+| 항목 | Spark Structured Streaming | Apache Flink |
+|------|---------------------------|--------------|
+| 트리거 단위 | micro-batch 의 매 iteration | 시간 기반 (예: 30초 간격) |
+| 설정 키 | `checkpointLocation` | `enable_checkpointing(interval, mode)` |
+| 종료 후 보존 | 기본 보존 | `RETAIN_ON_CANCELLATION` 명시 필요 |
+| state 동기화 | sync (3.4.0 부터 async 실험적) | 비동기 가능 |
+| 추천 use case | 메트릭 단위 정합성 중요한 잡 | 낮은 지연이 중요한 잡 |
+
+> **사이드바 — Asynchronous Progress Tracking**
+> Apache Spark 3.4.0 부터 micro-batch 와 동기화되지 않는 비동기 체크포인트 지원이 추가됨.
+> 단, 책 집필 시점(2024) 기준 실험적 기능이며 오픈소스 버전은 state store 를 지원하지 않음.
+
+> **트러블 로그** — Flink 잡을 재시작했는데 윈도우 카운트가 0부터 다시 세는 황당한 사고는 보통 `RETAIN_ON_CANCELLATION` 누락 때문.
+> 예: 30초 간격 체크포인트로 잘 돌던 사용자 세션 카운트 잡을 운영자가 배포를 위해 cancel → 재시작 후 모든 윈도우 상태가 사라져
+> "지난 1시간 활성 사용자 수" 가 0으로 리셋. 기본 동작이 "잡 취소 시 체크포인트도 같이 삭제" 이기 때문.
+> 또 다른 흔한 사고는 Spark 의 `checkpointLocation` 을 매 배포마다 다른 경로로 잡는 것 —
+> 사실상 매번 처음부터 재처리하면서 운영자는 "체크포인트는 설정했는데 왜 같은 데이터가 또 들어오지" 로 혼란.
+> **production 체크포인트 경로는 잡 이름·환경 단위로 고정** 하고, 배포 자동화에서 경로 변경 PR 에는 별도 리뷰를 강제할 것.
+
+---
+
+## 6. 요약
 
 오류는 피할 수 없음 — 버그, 낮은 품질의 입력 데이터, 일시적 하드웨어 이슈 등 원인은 다양함.
-이 챕터의 5개 패턴은 **"데이터 자체의 결함"** 을 운영적으로 다루는 도구상자.
+이 챕터의 7개 패턴은 **"데이터 자체의 결함"** 과 **"잡 운영 중의 결함"** 모두를 운영적으로 다루는 도구상자.
 
-### 4-1. 5개 패턴 한눈 비교
+### 6-1. 7개 패턴 한눈 비교
 
 | # | 패턴 | 카테고리 | 책의 use case 시나리오 | 핵심 트레이드오프 |
 |---|------|---------|----------------------|----------------|
-| 09 | Dead-Letter | 처리 불능 | Kafka → object store, poison pill로 잡 중단 반복 | 운영 안정성 ↔ 오류 은폐 + 백필 눈덩이 |
+| 09 | Dead-Letter | 처리 불능 | Kafka → object store, poison pill 로 잡 중단 반복 | 운영 안정성 ↔ 오류 은폐 + 백필 눈덩이 |
 | 10 | Windowed Deduplicator | 중복 | 스트리밍 → 배치 동기화 시 producer 재시도 중복 | 정확성 ↔ state store 크기 + 자원 |
 | 11 | Late Data Detector | 지연 탐지 | 네트워크 단절 사용자가 한꺼번에 flush 한 방문 이벤트 | 단조성(MAX) ↔ skew 시 데이터 손실 |
 | 12 | Static Late Data Integrator | 지연 통합 | 외부 사이트 일일 통계 (15일 approximate) | 단순함 ↔ 자원 낭비 + 윈도우 밖 손실 |
 | 13 | Dynamic Late Data Integrator | 지연 통합 | "15일 넘은 지연도 반영" 비즈니스 요구 변경 | 자원 효율 ↔ state table + 동시성 복잡도 |
+| 14 | Filter Interceptor | 필터링 | 배포 직후 필터링 비율이 15% → 90% 로 폭증 | 관측성 ↔ 스트리밍은 stateful 전환 비용 |
+| 15 | Checkpointer | 내결함성 | 10분 윈도우 unique visit 집계의 fatal failure 복구 | delivery guarantee ↔ latency |
 
-### 4-2. 패턴 선택 의사결정 가이드
+### 6-2. 패턴 선택 의사결정 가이드
 
 ```
-"파이프라인에서 오류/이상 데이터가 관측됐다"
+"파이프라인에서 오류/이상 상황이 발생했다"
               │
               ▼
 [Q1] 어떤 종류의 문제인가?
-  ├─ 페이로드 파싱 실패 / 스키마 위반 ──► #09 Dead-Letter
-  ├─ 같은 이벤트가 여러 번 도착             ──► #10 Windowed Deduplicator
-  └─ event_time 이 현재 워터마크보다 과거   ──► [Q2] 로
+  ├─ 페이로드 파싱 실패 / 스키마 위반            ──► #09 Dead-Letter
+  ├─ 같은 이벤트가 여러 번 도착                  ──► #10 Windowed Deduplicator
+  ├─ event_time 이 현재 워터마크보다 과거        ──► [Q2] 로
+  ├─ 필터 통과율이 갑자기 급변, 원인 모름         ──► #14 Filter Interceptor
+  └─ 스트리밍 잡이 죽으면 처음부터 재처리         ──► #15 Checkpointer
               │
               ▼
 [Q2] 지연 데이터를 어떻게 다룰까?
-  ├─ 그냥 무시해도 비즈니스적으로 OK         ──► #11 Late Data Detector 만 (drop)
-  ├─ 보존만 하고 별도 분석                  ──► #11 + DLQ-like side output (Flink)
-  └─ 실제로 다시 통합해야 함                 ──► [Q3] 로
+  ├─ 그냥 무시해도 비즈니스적으로 OK             ──► #11 Late Data Detector 만 (drop)
+  ├─ 보존만 하고 별도 분석                      ──► #11 + DLQ-like side output (Flink)
+  └─ 실제로 다시 통합해야 함                     ──► [Q3] 로
               │
               ▼
 [Q3] 통합 방식은?
-  ├─ 허용 기간이 고정(예: "최대 14일")        ──► #12 Static Late Data Integrator
-  └─ 허용 기간이 가변 + 자원 낭비 줄여야 함    ──► #13 Dynamic Late Data Integrator
+  ├─ 허용 기간이 고정 (예: "최대 14일")          ──► #12 Static Late Data Integrator
+  └─ 허용 기간이 가변 + 자원 낭비 줄여야 함       ──► #13 Dynamic Late Data Integrator
               │
               ▼
-[Q4] 스트리밍 잡이라면?
-  └─ withWatermark + dropDuplicates 결합 필수
-     (#10 + #11 은 실질적으로 한 파이프라인에서 같이 동작)
+[Q4] 스트리밍 잡이라면 (모든 케이스 공통)?
+  ├─ withWatermark + dropDuplicates             ──► #10 + #11
+  ├─ checkpointLocation / enable_checkpointing  ──► #15
+  └─ 필터가 둘 이상 묶이면 카운터 부착            ──► #14
 ```
 
-### 4-3. 실무 조합 예시 (책 use case 기반)
+### 6-3. 실무 조합 예시 (책 use case 기반)
 
 **시나리오 1: 블로그 방문 이벤트 스트리밍 처리 (Bronze → Silver)**
 - 챕터 2의 #03 CDC (Kafka 적재) 와 결합
-- #09 Dead-Letter (JSON 파싱 실패용 DLQ topic) + #10 Windowed Deduplicator (`visit_id, visit_time` 기준) + #11 Late Data Detector (`withWatermark('event_time', '1 hour')`)
-- 셋이 한 스트리밍 잡 안에서 동시 적용
+- #09 Dead-Letter (JSON 파싱 실패용 DLQ topic) + #10 Windowed Deduplicator (`visit_id, visit_time` 기준)
+  + #11 Late Data Detector (`withWatermark('event_time', '1 hour')`) + #15 Checkpointer (`checkpointLocation`)
+- 네 패턴이 한 스트리밍 잡 안에서 동시 적용. 추가로 #14 Filter Interceptor 를 `is_bot=false` 같은 핵심 필터에 부착해 봇 트래픽 비율 변화 모니터링
 
 **시나리오 2: 외부 참조 사이트 일일 통계 (Gold)**
 - 데이터 지연이 최대 15일까지 발생, 그 이후는 비즈니스적으로 무의미
@@ -875,19 +1190,21 @@ with DAG('devices_loader', max_active_runs=5,
 
 **시나리오 4: 신규 잡 배포 직후 모니터링**
 - 모든 변환 함수를 `try-catch` 래핑 + #09 Dead-Letter sink 구성
-- 드롭률 알람을 baseline 대비 비율로 설정 (절대 건수 X)
+- 핵심 필터에 #14 Filter Interceptor 의 카운터 부착 → 통과율을 baseline 대비 비율로 알람
 - 임계치 초과 시 잡 자동 정지 → downstream 오염 차단
 
-### 4-4. 패턴 전반을 관통하는 운영 원칙
+### 6-4. 패턴 전반을 관통하는 운영 원칙
 
-이 챕터를 관통하는 4가지 운영 교훈:
+이 챕터를 관통하는 5가지 운영 교훈:
 
-- **오류를 숨기는 만큼 알람으로 보상하라** — Dead-Letter, Late Data Detector 모두 fail-fast 를 포기하는 대가로 "조용히 잘못된 데이터가 흐르는" 위험을 떠안음. 드롭률·지연율 알람은 패턴의 일부로 봐야 하며, 알람 없는 데드 레터는 사고를 며칠 뒤로 미룰 뿐.
-- **Exactly-once 처리 ≠ Exactly-once 전달** — Windowed Deduplicator 와 워터마크는 처리 측의 보장만 줄 뿐, 진짜 한 번의 전달은 Chapter 4 의 idempotency 패턴이 별도로 필요. 두 개념을 혼동하면 "중복 제거를 했는데 왜 중복이 나오지" 라는 디버깅에 시간을 낭비함.
-- **워터마크의 단조성(monotonicity)이 stateful 잡의 전제** — 워터마크가 뒤로 가면 윈도우 정합성과 state store 가 동시에 망가짐. partition-level 은 `MAX` 가 기본, `MIN` 은 stuck-in-the-past 가 발생할 수 있어 신중히 적용.
+- **오류를 숨기는 만큼 알람으로 보상하라** — Dead-Letter, Late Data Detector, Filter Interceptor 모두 fail-fast 를 포기하거나 사일런트한 거동을 만드는 대가로 "조용히 잘못된 데이터가 흐르는" 위험을 떠안음. 드롭률·지연율·필터 통과율 알람은 패턴의 일부로 봐야 하며, 알람 없는 데드 레터/필터는 사고를 며칠 뒤로 미룰 뿐.
+- **Exactly-once 처리 ≠ Exactly-once 전달** — Windowed Deduplicator·워터마크·Checkpointer 모두 처리 측의 보장만 줄 뿐, 진짜 한 번의 전달은 Chapter 4 의 idempotency 패턴이 별도로 필요. 두 개념을 혼동하면 "중복 제거를 했는데 왜 중복이 나오지" 라는 디버깅에 시간을 낭비함.
+- **워터마크의 단조성(monotonicity) 이 stateful 잡의 전제** — 워터마크가 뒤로 가면 윈도우 정합성과 state store 가 동시에 망가짐. partition-level 은 `MAX` 가 기본, `MIN` 은 stuck-in-the-past 가 발생할 수 있어 신중히 적용.
 - **백필은 lookback 윈도우를 의식해서 돌려라** — Static 패턴에서 잘못 백필하면 같은 데이터가 lookback 배수만큼 중복 처리되어 비용이 폭증함. Dynamic 패턴에서는 `depends_on_past` 와 함께 stuck-state 알람을 반드시 짝지어야 long in-progress 사고를 막을 수 있음.
+- **체크포인트는 "어디에 / 얼마나 자주 / 잡 종료 후 어떻게" 의 3축으로 설계하라** — Checkpointer 도입 시에는 영속 저장소 경로(잡 이름·환경 단위 고정), 빈도(SLA 기반 latency vs 재처리량), 종료 시 보존(`RETAIN_ON_CANCELLATION` 등) 을 모두 명시. 한 축만 빠뜨려도 "체크포인트는 켰는데 왜 같은 데이터가 다시 들어오지" 사고가 발생.
 
-### 4-5. 다음 챕터와의 연결
+### 6-5. 다음 챕터와의 연결
 
 Error management 패턴은 exactly-once 의 "느낌" 만 줄 뿐, 진짜 한 번의 전달을 보장하지는 않음.
-이를 완성하는 것이 다음 챕터의 **Idempotency 패턴** — 재시도와 백필이 시스템 정합성을 깨지 않도록 만드는 도구들.
+처리 재시도와 백필이 시스템 정합성을 깨지 않도록 만드는 도구가 다음 챕터의 **Idempotency 패턴** —
+재처리에도 결과가 동일하게 유지되는 파이프라인을 만들기 위한 다음 단계.
