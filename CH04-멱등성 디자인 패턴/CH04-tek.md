@@ -144,6 +144,7 @@ idempotency 동작 (DROP 기반):
 `fast` 와 `data removal` 키워드가 매력적이지만, 다음 함정이 있음.
 
 **Granularity and backfilling boundary — 정리 단위 = 백필 단위**
+> "지우고 다시 채우는 작업(백필 경계)을, 내가 원하는 만큼 정밀하게 쪼개서(세분화) 처리할 수 없다"
 - idempotency granularity 가 곧 **backfilling granularity**. 파이프라인을 replay 하려면 **파티션 테이블 생성 task부터** 다시 돌려야 함. 아니면 데이터셋이 불일치 상태가 됨.
 - 예: weekly partition 인데 화요일 하루만 백필 필요 → 그 주 전체를 재실행해야 함. 단, 다른 요일들은 data loading step 만 selective replay 가능 (full pipeline 재실행은 불필요).
 - 더 fine-grained 한 단위 (예: 한 user/customer) 의 백필에는 **부적합** — 메타데이터 연산은 항상 whole table 에 동작하기 때문.
@@ -156,7 +157,7 @@ idempotency 동작 (DROP 기반):
 - 또한 **메타데이터 연산을 지원하는 DB** (data warehouse, lakehouse, RDBMS) 에서만 동작. object store 위에서는 사실상 불가 → `Data Overwrite` 로 대체.
 
 **Data exposition layer — 단일 진입점 유지**
-- 데이터셋이 더 이상 single place 에 살지 않음 → 사용자가 "내부 분할 구조" 를 몰라도 되게 view 같은 logical 구조로 통합 노출 필요.
+- 데이터셋이 더 이상 한 곳에 존재하지 않음 → 사용자가 "내부 분할 구조" 를 몰라도 되게 view 같은 logical 구조로 통합 노출 필요.
 
 **Schema evolution — 스키마 변경의 비용**
 - idempotent 테이블에 새 컬럼이 추가되면 **기존 테이블들의 스키마를 별도 파이프라인으로 업데이트** 해야 함.
