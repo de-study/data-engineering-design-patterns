@@ -250,3 +250,182 @@ final_deduplicated_visits = (
         - 각 데이터 원천 위에 첫 번째 집계가 있고, 모든 데이터 원천을 대상으로 한 추가 집계가 존재하며 각 원천에 `MIN` 함수를 적용하고 전체에 `MAX` 함수를 적용하거나 그 반대로도 가능
 3. 예상 밖의 지연을 허용하기 위해 허용된 지연 시간 속성 필요
     - `MAX(event_time) - allowed_lateness` 로 표현됌 - 이벤트를 제시간에 도착한 것으로 간주하는 최소 이벤트 시간(워터마크)를 의미
+  
+# 3.4 필터링
+
+## 패턴 #14: 필터 인터셉터
+
+### 3.4.1 문제
+
+- 필터링된 데이터 크기의 변화가 데이터에서 비롯된 것인지 소프트웨어 회귀에서 비롯된건지 파악이 어려움
+- 프레임워크가 수행하는 많은 최적화 중 여러 필터링 표현식을 단일 표현식으로 통합하는 기능
+
+### 3.4.2 해결책
+
+- 물리적 쿼리 실행 계획 분석으로 해결 가능
+    - 실행 계획이 모든 필터에 대한 핖ㄹ터링된 레코드의 수를 포함하고 각 조건에 대한 통계도 포함하여야 함
+1. 데이터 처리 프레임워크에서 프로그래밍 API 사용
+2. SQL 사용
+    - 필터 표현식이 `a is not null` , `b != "abc"` 일 때:
+        - 두 표현식을 서브쿼리 테이블에 유효성 결과를 저장하는 새로운 컬럼으로 포함
+        - 추후 메인 쿼리에서 필터링 술어로 사용
+
+### 3.4.3 결과
+
+#### 1. 런타임 영향
+
+- 필터링 조건을 래퍼로 감싸는 것 (where절에 함수사용(cast, upper…))은 잡 실행 시간과 자원에 영향을 미침 → optimizer가 최적화를 못하기 때문에
+
+#### 2. 선언적 언어
+
+- 선언형 언어(SQL)는 프로그래밍 API 보다 덜 강력하기도 한데 그 예시가 필터 인터셉터
+
+#### 3. 스트리밍
+
+- SQL보다는 구현이 쉽지만 상태 비저장을 저장 잡으로 변환해야하므로 지금까지 적용된 필터 수를 세기 위해 추가적인 상태 관리 오버헤드 발생 가능
+- 데이터가 스트리밍 되기 때문에 인터셉터 통계를 위한 시간 경계를 정의해야함
+
+### 3.4.4 예제
+
+#### 1. 파이스파크의 필터 인터셉터
+
+```python
+# 데이터 구조 정의
+@dataclasses.dataclass
+class FilterWithAccumulator:
+    name: str                        # 필터의 이름 (예: 'type is null')
+    filter: Callable[[Any], bool]    # 실제 통과 여부를 검사하는 함수 (True면 통과, False면 탈락)
+    accumulator: Accumulator[int]    # 탈락한 데이터의 개수를 누적할 Spark 어큐뮬레이터
+
+# 필터 룰셋 정의 
+filters_with_accumulators = {
+    'type': [
+        FilterWithAccumulator(
+            'type is null', 
+            lambda device: device['type'] is not None,
+            spark_context.accumulator(0)
+        ),
+        FilterWithAccumulator(
+            'type is too short (1 chars or less)',
+            lambda device: len(device['type']) > 1, 
+            spark_context.accumulator(0) # 0부터 시작하는 카운터 만드는 작업
+        )
+    ],
+    # ...
+}
+
+def filter_null_type(devices_iterator: Iterator[pandas.DataFrame]):
+    def filter_row_with_accumulator(device_row):
+        for device_row_attribute in device_row.keys():
+            for filter_with_accumulator in filters_with_accumulators[device_row_attribute]:
+                # 만약 필터 조건에 부합하지 않는다면 (탈락 대상이라면)
+                if not filter_with_accumulator.filter(device_row):
+                # 인터셉트 포인트: 해당 필터의 카운터를 1 증가 
+                    filter_with_accumulator.accumulator.add(1)
+                    return False # 탈락이므로 즉시 false 변환 
+        return True # 모든 필터 통과하면 true 반환
+
+    for devices_df in devices_iterator:
+        yield devices_df[devices_df.apply(lambda device: 
+            filter_row_with_accumulator(device), axis=1) == True]
+
+# mapInPandas를 통해 분산 환경에서 대용량의 데이터를 Pandas 속도로 빠르게 필터링
+valid_devices = input_dataset.mapInPandas(filter_null_type, input_dataset.schema)
+valid_devices.write.mode('append').format('delta').save(output_dir)
+
+for key, accumulators in filters_with_accumulators.items():
+for accumulator_with_filter in accumulators:
+    print(f'{key} // {accumulator_with_filter.name} // {accumulator_with_filter.accumulator.value}')
+```
+
+#### 2. 필터 인터셉터를 위한 SQL 쿼리
+
+```python
+# 1. 입력 데이터에 조건별 status_flag를 부여하고 임시 뷰 생성
+spark_session.sql('''SELECT * FROM (
+    SELECT
+        CASE
+            WHEN (type IS NOT NULL) IS FALSE THEN 'null_type'
+            WHEN (LEN(type) > 2) IS FALSE THEN 'short_type'
+            WHEN (full_name IS NOT NULL) IS FALSE THEN 'null_full_name'
+            WHEN (version IS NOT NULL) IS FALSE THEN 'null_version'
+            ELSE NULL
+        END AS status_flag,
+        type, full_name, version
+    FROM input
+)
+''').createTempView('input_with_flags')
+
+# 2. 필터링된 레코드의 수를 세고 그룹화하여 임시 뷰 생성
+spark_session.sql('''SELECT COUNT(*), status_flag FROM input_with_flags WHERE status_flag IS NOT NULL GROUP BY status_flag''').createTempView('grouped_filters')
+
+# 3. 유효한 레코드(status_flag가 NULL인 데이터)만 필터링하여 Delta 포맷으로 저장
+(spark_session.sql('SELECT type, full_name, version FROM input_with_flags WHERE status_flag IS NOT NULL') # 주의: 하단 설명 글에는 '유효한 모든 레코드'라고 명시되어 있으나, 실제 저장 쿼리의 WHERE 조건문은 문맥상 'IS NULL'의 오타이거나 본문 목적에 따른 필터링 결과일 수 있습니다. 이미지 상에는 'IS NOT NULL'로 인쇄되어 있습니다.
+.write.mode('append').format('delta').save(f'{base_dir}/devices-valid-sql-table'))
+```
+
+# 3.5 내결함성
+
+## 패턴 #15: 체크포인터
+
+### 3.5.1 문제
+
+- 스트리밍 데이터 처리에서 재처리에 대한 위험을 줄일 방법이 필요
+
+### 3.5.2 해결책
+
+소비된 데이터 원천에서 최신 위치와 계산된 상태 추적 → 체크포인터 패턴으로 가능
+
+#### 1. 체크포인팅
+
+- 잡의 환경보다 더 영구적인 저장소에 데이터 처리 프로세스를 기록하는 것으로 잡을 재시작할 때 변경 가능
+- 컨슈머의 논리에 따라 아래 두가지로 분류
+    - 데이터 처리 프레임워크 기반: 진행 경과 정보가 프레임워크 자체에서 관리됌 ex) 아파치 스파크, 플링크
+    - 데이터 스토어 기반: 데이터 스토어 SDK를 사용하는 경우 체크포인트 정보를 위해 데이터 스토어 계층과 상호작용할 수 있음 ex) 카프카, kinesis
+        - 체크포인트 데이터를 카프카는 토픽(`__consumer_offsets`)에, 키네시스는 아마존 DynamoDB 테이블에 기록
+- 체크포인트 작업 구현 방식도 2가지
+    - 구성 기반 방식: 체크포인트 빈도만 설정, 실행을 라이브러리에 위임 ex) 아파치 스파크, 플링크
+    - 코드 상에서 의도적인 체크포인팅 작업에 의존하는 방식: 레코드를 조회하고 처리한 후 다음 실행에서 동일한 데이터를 받지 않도록 체크포인트 확인 ex) 카프카
+
+### 3.5.3 결과
+
+추가적인 내결함성을 제공하지만 데이터 지연이라는 단점을 가짐
+
+#### 1. 전송 보장 vs 지연 시간 트레이드오프
+
+- 체크포인트의 빈도가 높아지면 체크포인트 생성에 따른 오버헤드로 잡이 느려질 수 있음
+- 더 적은 빈도의 체크포인트를 선택하면 잡이 메타데이터를 다루는 시간은 줄어들 수 있지만 잡 실패시 재처리해야할 데이터의 범위가 커질 수 있음
+
+#### 2. 정확히 한 번만 처리된 것 같은 느낌
+
+- 잡이 분산 처리되기 때문에 그렇게 느낄 수 있지만 멱등성 패턴을 적용하지 않으면 그렇지 않음
+- 전달모드: 정확히 한번, 최소 한번, 최대 한번
+
+### 3.5.4 예제
+
+#### 1. apache structured streaming의 체크포인트
+
+```python
+write_query = (input_stream_data.writeStream.outputMode('update')
+    .option('checkpointLocation', f'{base_dir}/checkpoint')
+    .foreachBatch(synchronize_visits_to_files).start())
+    
+    
+$ cat /tmp/dedp/ch03/fault-tolerance/micro-batch/checkpoint/offsets/18
+# omitted two irrelevant lines
+{"visits":{"1":1276,"0":1224}}
+```
+
+- 잡의 반복 시점에 오프셋 기록 → 오베헤드를 가중시키지만 더 강력한 보장 제공, 재시작 시 중복 처리 위험 감소
+
+#### 2. 아파치 플링크를 사용한 시간 기반 체크포인팅
+
+```python
+checkpoint_interval_30_sec = 30000
+env.enable_checkpointing(checkpoint_interval_30_sec, mode=EXACTLY_ONCE)
+
+(env.get_checkpoint_config().enable_externalized_checkpoints(RETAIN_ON_CANCELLATION))
+```
+
+- 시간 기반으로 동작
+- `RETAIN_ON_CANCELLATION`**:** 잡의 실패 후 체크포인트된 파일을 유지(기본적으로 체크포인트 위치는 잡 인스턴스에 연결)하고 잡이 재시작될 때마다 플링크가 이를 제거
