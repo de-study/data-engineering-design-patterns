@@ -17,6 +17,9 @@
 3. [데이터베이스 (Database)](#3-데이터베이스-database)
    - 패턴 #20: 키 기반 멱등성 (Keyed Idempotency)
    - 패턴 #21: 트랜잭션 기반 작성자 (Transactional Writer)
+4. [불변의 데이터셋 (Immutable Dataset)](#4-불변의-데이터셋-immutable-dataset)
+   - 패턴 #22: 프록시 (Proxy)
+5. [요약 (Summary)](#5-요약-summary)
 
 ---
 
@@ -41,7 +44,7 @@
 챕터 4 가 다루는 영역
 ==========================================================================
 
-[챕터 3 패턴들]                       [현실 = 자동 재시도]
+[챕터 3 패턴들]                         [현실 = 자동 재시도]
    - Dead-Letter                        - task retry
    - Windowed Deduplicator              - job restart
    - Late Data Integrator               - producer 재전송
@@ -52,19 +55,46 @@
               [중복 / 부분 적재 / 불일치]
                           │
                           ▼
-                ┌─────── 멱등성 패턴 ───────┐
+                ┌─────── 멱등성 패턴 ───────────┐
                 │                            │
         ┌───────┴────────┐         ┌─────────┴──────────┐
         ▼                ▼         ▼                    ▼
   [4.1 Overwriting] [4.2 Updates] [4.3 Database] [4.4 Immutable]
    #16, #17          #18, #19      #20, #21       #22
 
-  본 문서가 다루는 범위: 4.1 Overwriting (#16, #17) / 4.2 Updates (#18, #19) / 4.3 Database (#20, #21)
+  본 문서가 다루는 범위: 4.1 Overwriting (#16, #17) / 4.2 Updates (#18, #19) / 4.3 Database (#20, #21) / 4.4 Immutable (#22)
 ==========================================================================
 
 원칙: 잡을 N번 돌려도 결과 데이터셋 상태가 동일해야 함
       ─ 재시도·백필이 일상이라는 전제에서 출발하는 설계
 ```
+
+### 챕터 4 전체 스펙트럼 — 중복 제거를 누가·어떻게 하는가
+
+네 패밀리는 **"멱등성을 어떻게 달성하는가 = 중복 제거를 누가·어떻게 하는가"** 를 기준으로 나뉨.
+왼쪽일수록 **내가 직접 거칠게** 처리하고, 오른쪽일수록 **정교해지거나 DB·간접 계층에 위임** 함.
+
+```
+[챕터 4 멱등성 패턴 스펙트럼]
+==========================================================================
+ 거칠다 ─────────────────────────────────────────────────► 정교하다 / 위임한다
+
+ 4.1 Overwriting   4.2 Updates       4.3 Database       4.4 Immutable
+   #16 #17           #18 #19           #20 #21             #22 …
+ "통째로 지우고       "증분을 기존         "멱등성 보장을         "지울 수도
+  새로 쓴다"          데이터에 합친다"      DB 에 위임한다"       없을 때 우회"
+
+ 작업 주체:         작업 주체:           작업 주체:            작업 주체:
+ 저장소/메타데이터     처리·쓰기 로직         DB 엔진             간접 계층(Proxy 등)
+==========================================================================
+```
+
+| 패밀리 | 적용 상황 (언제 쓰나) | 적용 데이터 | 중복 제거 주체 |
+|---|---|---|---|
+| **4.1 Overwriting** (#16, #17) | 데이터셋 **전체를 매번 교체** 할 수 있을 때 | full dataset · 주로 **배치**. #16 = 메타데이터 연산 지원 DB(웨어하우스/레이크하우스/RDBMS), #17 = object store 등 메타데이터 레이어가 없는 곳 | 저장소·메타데이터 레이어 |
+| **4.2 Updates** (#18, #19) | 전체를 못 받고 **변경분만** 들어옴(CDC 등) → 덮어쓰기 불가 | **증분 갱신(incremental) 데이터셋** · 배치로 변경분 반영 | 처리·쓰기 로직(`MERGE`) + 오케스트레이션 상태(#19) |
+| **4.3 Database** (#20, #21) | 멱등성을 직접 짜기 번거로움 → **DB 기능에 위임** | #20 = **스트리밍** 세션 생성(key-value/NoSQL, append time 키) · #21 = **배치·스트리밍 모두**(트랜잭션 지원 스토어: 테이블 파일 포맷·DW·RDBMS·Kafka) | DB 엔진(키 유일성 / 트랜잭션) |
+| **4.4 Immutable** (#22 …) | 기존 데이터를 **지우거나 수정할 수 없음**(법적 보관 등) | 매번 전체 생성하되 **과거 버전 모두 보존** 필요 | 간접 계층(Proxy / view 스위칭) |
 
 > 참고
 > — Maxime Beauchemin 의 2018년 글 "Functional Data Engineering: A Modern Paradigm for Batch Data Processing" 이 데이터 엔지니어링에 멱등성 개념을 대중화시킨 출발점. 책 저자가 챕터 도입부에서 직접 언급.
@@ -126,35 +156,54 @@
    `DROP` 기반에서는 사용자가 view 를 조회하는 도중 drop 이 일어나면 에러가 날 수 있으므로,
    **"view 에서 테이블 제거 → DROP → CREATE → view 에 다시 포함"** 순서를 권장.
 
-incremental/partitioned 가 아니라 **full dataset** 에도 적용 가능
-— 매 load 마다 단순히 테이블 재생성으로 단순화하거나,
-대안으로 다음 절의 `Data Overwrite` 패턴을 사용.
+incremental/partitioned 가 아니라 **full dataset** 에도 적용 가능 — 매 load 마다 테이블 전체를 재생성하거나, 대안으로 다음 절의 `Data Overwrite` 패턴을 사용.
 
 ```
-주간 파티션 + 단일 view 노출 구조
+[Figure 4-1 재현] 물리적으로 분할된 주간 테이블 + 공통 노출 view
 --------------------------------------------------------------
 [Pipeline, week 1, 2024]  ──►  [Visits, week 1, 2024]  ┐
 [Pipeline, week 2, 2024]  ──►  [Visits, week 2, 2024]  │
-                                                       ├── view: visits_2024
+                                                       ├── view: Visits, weeks 1–52, 2024
         ...                          ...               │   (사용자 단일 진입점)
 [Pipeline, week 52, 2024] ──►  [Visits, week 52, 2024] ┘
+--------------------------------------------------------------
+```
+52개 주간 테이블이 1년치 데이터를 이루고, 사용자는 view 하나로만 접근 → 내부 분할 구조를 몰라도 됨.
 
-idempotency 동작 (TRUNCATE 기반):
-  실행일 = 월요일/1월 1일 ?
+```
+[Figure 4-2 재현] 증분·분할 테이블에서의 Fast Metadata Cleaner (TRUNCATE / DROP)
+--------------------------------------------------------------
+■ TRUNCATE TABLE 기반
+  실행일 분석 → "월요일 또는 1월 1일?"
        ├─ Yes → 테이블 없으면 생성 → view 에 포함 → TRUNCATE
-       │                                            └─► daily 데이터 처리 → weekly 테이블에 적재
-       └─ No  → daily 데이터 처리 → weekly 테이블에 적재
+       │                                          └─► daily 처리 → weekly 테이블 적재
+       └─ No  → daily 처리 → weekly 테이블 적재
 
-idempotency 동작 (DROP 기반):
-  실행일 = 월요일/1월 1일 ?
-       ├─ Yes → view 에서 테이블 제거 → DROP → 테이블 재생성 → view 에 다시 포함
-       │                                                       └─► daily 처리 → 적재
+■ DROP TABLE 기반
+  실행일 분석 → "월요일 또는 1월 1일?"
+       ├─ Yes → view 에서 테이블 제거 → DROP → 테이블 생성 → view 에 다시 포함
+       │                                                     └─► daily 처리 → 적재
        └─ No  → daily 처리 → 적재
 --------------------------------------------------------------
+```
+새 granularity(월요일/연초)에만 정리 작업이 일어나고, 그 외 날은 곧장 적재.
+DROP 기반은 view 조회 중 에러를 피하려 **"view 에서 빼기 → DROP → 재생성 → view 에 다시 포함"** 순서를 지킴.
 
-비교 — 기존 DELETE+INSERT vs Fast Metadata Cleaner
-  - DELETE+INSERT  : O(데이터 크기), 행 스캔 + 파일 재작성 필요 → 시간이 갈수록 무거워짐
-  - TRUNCATE/DROP  : O(1), 메타스토어 변경만으로 끝남 → 데이터 크기와 무관
+```
+[Figure 4-3 재현] full dataset(비분할) 변형 — 실행일 분기·view 없음
+--------------------------------------------------------------
+■ TRUNCATE 기반 : 테이블 없으면 생성 → TRUNCATE → daily 처리 → 테이블 적재
+■ DROP 기반     : DROP → 테이블 생성 → daily 처리 → 테이블 적재
+--------------------------------------------------------------
+```
+분할이 없으니 "월요일/1월 1일?" 분기도, view 도 불필요 — 매 load 마다 테이블 전체를 재생성하는 단순 형태.
+
+```
+[비교] 기존 DELETE+INSERT vs Fast Metadata Cleaner
+--------------------------------------------------------------
+  DELETE+INSERT  : O(데이터 크기), 행 스캔 + 파일 재작성 필요 → 시간이 갈수록 무거워짐
+  TRUNCATE/DROP  : O(1), 메타스토어 변경만으로 끝남 → 데이터 크기와 무관
+--------------------------------------------------------------
 ```
 
 #### 고려사항 (Consequences)
@@ -1262,3 +1311,189 @@ Kafka 도 SQL/테이블 포맷과 똑같이 "commit 전까지 비공개" 로 동
 > — Flink Kafka 싱크의 `transaction.timeout.ms` 를 30초로 두고 checkpoint 가 평소 45초 걸리는 잡을 돌리면,
 > 트랜잭션이 만료돼 commit 이 실패하고 출력 토픽이 비어버림.
 > **멱등성은 트랜잭션 범위 안으로만 보장됨을 전제로 백필/재시작 시 중복 처리를 별도 설계하고(예: 잡 전체 트랜잭션 + 처리 이력 추적), Flink 라면 transaction.timeout.ms 를 checkpoint 소요시간보다 넉넉히 길게 잡을 것.**
+
+---
+
+## 4. 불변의 데이터셋 (Immutable Dataset)
+
+앞의 세 패밀리(#16~#21)는 모두 **mutable dataset** 을 전제로 함
+— 데이터를 마음대로 바꿀 수 있고, 전체 삭제(total data removal)까지 가능했음.
+그런데 **기존 데이터를 지우거나 갱신할 수 없다면** 어떻게 멱등성을 달성할까?
+(예: 법적 보관 의무로 과거 버전을 모두 남겨야 하는 경우)
+
+이 시나리오를 위한 전용 패턴이 **#22 Proxy** 임.
+
+- **#22 Proxy** — 데이터는 매번 새 위치에 **한 번만 write**(write-once) 하여 과거 버전을 모두 보존하되,
+  소비자에게는 **중간 계층(view·manifest)** 을 통해 항상 최신 데이터 하나만 단일 지점으로 노출.
+
+---
+
+### 4-1. 패턴 #22: 프록시 (Proxy)
+
+> 엔지니어링 격언 *"We can solve any problem by introducing an extra level of indirection"*
+> (어떤 문제든 간접 계층을 하나 더 끼워 넣으면 풀 수 있다) 에서 이름을 따온 패턴.
+> 핵심은 **소비자와 실제 물리 저장소 사이에 한 겹의 간접 계층(proxy)** 을 두는 것.
+
+#### 상황 (Problem)
+
+**책의 use case** — 디바이스/방문 데이터를 매번 full dataset 으로 생성하는 배치 잡:
+
+- 배치 잡이 매 실행마다 **전체 데이터셋** 을 생성함.
+- 최신 버전만 필요했기에 지금까지는 **이전 데이터셋을 덮어써(overwrite)** 옴 — 즉 mutable 접근.
+- 그런데 **법무팀(legal department)** 이 **모든 과거 버전의 사본을 보존** 하라고 요구함
+  → 덮어쓰는 현재 방식으로는 더 이상 충족 불가.
+- **결정적 제약**: 데이터셋이 **immutable(한 번만 쓰기, write-once)** 이어야 함.
+  동시에 소비자에게는 **언제나 최신 테이블 하나만, 단일 지점에서** 노출해야 함
+  — "모든 버전을 보존" 과 "최신 하나만 노출" 을 **동시에** 만족시켜야 하는 게 핵심 난점.
+
+#### 해결 (Solution)
+
+요구사항(immutable + 단일 접근점)을 푸는 방법이 **Proxy 패턴**.
+네트워크 엔지니어링의 proxy 처럼, **최종 사용자와 실제 물리 저장소 사이의 중간 컴포넌트** 역할을 함.
+
+동작은 크게 **(A) immutability 보장** 과 **(B) 단일 접근점(proxy) 제공** 두 단계로 나뉨.
+
+**(A) immutability(write-once) 보장**
+
+- 새 데이터를 **매번 다른 위치** 에 적재 — 이름에 **버전/타임스탬프 suffix** 를 붙인 테이블 사용.
+- 생성 직후 **모든 쓰기 권한을 제거** → 그 테이블은 **딱 한 번만 writable**.
+- 저장 계층이 **object store** 위라면 더 쉬움 — locking 으로 강화 가능.
+  이 잠금 방식이 **WORM (write once read many)** 이며, 주요 object store 가 모두 지원:
+  - AWS S3 → **Object Lock**
+  - Azure Blob → **immutability policies**
+  - GCP → **object holds / bucket holds**
+
+**(B) 단일 접근점(proxy) 제공**
+
+소비자가 최신 데이터에 접근할 **하나의 진입점** 을 만듦. 구현은 세 가지.
+
+- **구현 1 — View 기반**: 변환 없는 passthrough view 가 최신 테이블을 가리킴 (`SELECT * FROM 최신테이블`).
+  대부분의 DW·RDBMS, 일부 NoSQL(OpenSearch alias, Apache Cassandra, ScyllaDB, MongoDB)에서 동작.
+- **구현 2 — Manifest 기반**: view 를 지원하지 않는 저장소라면, 소비자가 처리해야 할 파일 위치/목록을
+  담은 **manifest 파일** 을 직접 만듦. 책임 분리 관점에서 **manifest 생성을 데이터 처리 잡과 분리** 할 것
+  — manifest 생성이 실패해도 (느린) 데이터 재처리를 다시 하지 않아도 되기 때문.
+- **구현 3 — Versioned(네이티브 버전) 기반**: Delta Lake·Apache Iceberg 같은 table file format,
+  또는 BigQuery 같은 DW 활용. write 마다 테이블을 새로 만들 수도 있지만 더 단순한 방법이 있음
+  — **그냥 overwrite 해도** time travel 덕분에 과거 데이터가 디스크에 남아 조회·복원 가능.
+  단, retention 이 제한적이거나 설정 불가일 수 있음(예: BigQuery 는 작성 시점 기준 **7일**).
+  네이티브 버전 저장소는 쓰기 권한 제거가 **불가능** 하지만, 저장 시스템 자체가 버전을 남기므로
+  권한 관리 없이도 immutability 가 성립함 → Proxy 패턴이 **DB 기능에 크게 의존** 함을 보여줌.
+
+```
+[Figure 4-10 재현] Proxy 패턴의 세 가지 구현 시나리오
+──────────────────────────────────────────────────────────────────────
+ View 기반 (View-based)
+   [데이터 처리] → [버전 테이블에 적재] → [view 갱신] → [이전 테이블 읽기권한 제거]
+
+ Manifest 기반 (Manifest-based)
+   [데이터 처리] → [새 manifest 파일 생성] → [이전 파일 읽기권한 제거]
+
+ Versioned (네이티브 버전 활용)
+   [데이터 처리] → [일반 테이블에 적재]   (overwrite 해도 버전이 자동 보존됨)
+──────────────────────────────────────────────────────────────────────
+ 공통점: 소비자는 늘 "하나의 접근점" 만 보지만, 그 뒤로 과거 버전이 모두 살아 있음
+```
+
+위 그림은 같은 Proxy 목표(과거 보존 + 최신 단일 노출)를 세 가지 저장소 환경에 맞춰 구현하는 방식을 보여줌.
+view 를 못 쓰면 manifest 로, 네이티브 버전이 있으면 권한 조작 없이 overwrite 만으로 달성.
+
+#### 고려사항 (Consequences)
+
+겉보기엔 단순하고 익숙한 패턴이지만, 몇 가지 중요한 트레이드오프가 숨어 있음.
+
+- **Database support (저장소 지원)**
+  - 모든 DB 가 view 기능을 제공하지는 않음 — view 는 변하는 데이터셋을 노출하는 **immutable 접근점** 역할이라 핵심.
+  - view 가 없으면 **manifest 파일** 로 대체 가능하지만, 그만큼 **읽기 과정이 번거로워짐**.
+- **Immutability configuration (불변성 설정)**
+  - 데이터 오케스트레이션 레벨에서 **write task 의 출력 설정** 만으로는 immutability 강제가 **부족** 함.
+  - 저장소 자체에도 강제해야 하며, 이를 위해 **인프라팀의 도움** 이 필요할 수 있음
+    — object store 에 lock 을 걸거나, 테이블 생성 직후 **쓰기 권한을 제거**.
+
+#### 구현 예시 (Examples)
+
+책의 Apache Airflow + PostgreSQL 예시. 파이프라인은 두 단계로 구성됨.
+
+**예시 1 — 파이프라인 정의 (Example 4-23)**
+
+내부 테이블에 적재한 뒤 view 를 갱신하는 2단계 구조:
+```python
+load_data_to_internal_table = PostgresOperator(
+    sql='/sql/load_devices_to_weekly_table.sql'   # (1) 숨겨진 내부 테이블에 COPY 적재
+)
+refresh_view = PostgresOperator(  # ...
+    sql='/sql/refresh_view.sql'                   # (2) 소비자용 view 를 최신 내부 테이블로 갱신
+)
+
+load_data_to_internal_table >> refresh_view       # 적재 → view 갱신 순서 보장
+```
+
+**예시 2 — view 갱신 (Example 4-24)**
+
+view 가 가리키는 대상 테이블을 매번 **최신 내부 테이블 이름** 으로 바꿔치기:
+```sql
+{% set devices_internal_table = get_devices_table_name() %}
+CREATE OR REPLACE VIEW dedp.devices AS
+  SELECT * FROM {{ devices_internal_table }};   -- 변환 없는 passthrough view (단일 접근점)
+```
+
+**예시 3 — 고유 테이블 이름 생성 (Example 4-25)**
+
+재실행되어도 이전 데이터셋을 덮어쓰지 않도록, **매 실행마다 다른 테이블** 에 쓰기 위한 이름 생성:
+```python
+def get_devices_table_name() -> str:
+    context = get_current_context()
+    dag_run: DagRun = context['dag_run']
+    table_suffix = dag_run.start_date.strftime('%Y%m%d_%H%M%S')  # 파이프라인 시작 시각 기반 suffix
+    return f'dedp.devices_internal_{table_suffix}'               # 각 적재가 전용 저장 공간으로 감
+```
+
+파이프라인 시작 시각으로 suffix 를 만들면, 각 실행이 **서로 다른 immutable 테이블** 로 분리됨.
+
+```
+[Proxy 동작 — 과거 보존 + 최신 단일 노출]
+──────────────────────────────────────────────────────────────────────
+  월요일 run → devices_internal_20240701_000000   (보존, 쓰기권한 제거)
+  화요일 run → devices_internal_20240702_000000   (보존, 쓰기권한 제거)
+  수요일 run → devices_internal_20240703_000000   (보존, 쓰기권한 제거)
+                       │
+                       ▼  CREATE OR REPLACE VIEW dedp.devices
+            ┌──────────────────────────────┐
+   소비자 → │  view: dedp.devices          │ → 항상 "최신 한 개" 만 보임
+            └──────────────────────────────┘
+  ⇒ 과거 버전은 디스크에 전부 남아 있고(법적 보관 충족), 노출은 단일 접근점으로 일원화
+──────────────────────────────────────────────────────────────────────
+```
+
+| 구현 | 동작 | 주의사항 |
+|---|---|---|
+| View 기반 | 버전 테이블 적재 후 view 를 최신으로 재정의 | view 미지원 저장소에서는 사용 불가 |
+| Manifest 기반 | 처리 대상 파일 목록을 manifest 로 노출 | 읽기 과정이 번거로움 · manifest 생성을 처리 잡과 분리 |
+| Versioned(네이티브) | overwrite 해도 time travel 로 과거 버전 보존 | retention 제한/설정 불가 가능(예: BigQuery 7일) |
+
+> **트러블 로그** — Proxy 를 view 로만 구성하고 내부 테이블 권한을 방치하면 immutability 가 조용히 깨짐.
+> 예: `dedp.devices` view 뒤에 `devices_internal_YYYYMMDD` 테이블을 쌓는 구조에서,
+> 운영자 계정에 `DROP`·`DELETE` 권한이 그대로 남아 있으면 디스크 정리 중 실수로 과거 internal 테이블을
+> 지워버려 — view 는 멀쩡해 보여도 법적 보관 대상이던 3개월 치 버전이 사라질 수 있음.
+> 파이프라인 실행 계정에는 **테이블 생성(CREATE) 권한만** 부여하고, 생성된 테이블은 쓰기/삭제 권한을 제거하거나
+> object store 라면 Object Lock(WORM)을 걸어 물리적으로 변경 불가 상태로 만들 것.
+
+---
+
+## 5. 요약 (Summary)
+
+오류 관리(챕터 3)는 실패의 영향을 **처리 계층** 에서 완화할 뿐임.
+사이클을 완성하려면 **멱등성(idempotency)** 이 필요하고, 그게 이 챕터의 패턴들임.
+
+- **덮어쓰기(Overwriting, #16·#17)** — 매 실행마다 데이터셋을 통째로 교체.
+  `TRUNCATE`·`DROP` 같은 빠른 메타데이터 연산(#16)으로, 또는 데이터 파일을 물리적으로 교체(#17)해서 처리.
+  **전체 데이터셋을 매번 받을 수 있을 때** 적합.
+- **갱신(Updates, #18·#19)** — 전체가 아니라 **증분(incremental)** 만 들어올 때 `MERGE` 로 기존 데이터에 합침.
+  비싸 보이지만 최신 저장소는 메타데이터(통계)로 최적화함. 상태 저장 병합기(#19)는 오케스트레이션 상태까지 활용.
+- **데이터베이스(Database, #20·#21)** — 오케스트레이션 계층이 없거나(예: 스트리밍 잡) 직접 짜기 번거로우면
+  **DB 기능에 위임**. 멱등 키 생성(#20) 또는 트랜잭션(#21)으로 재시도 하에서도 유일 적재 보장.
+- **불변의 데이터셋(Immutable, #22)** — 데이터를 **한 번만 write** 해야 하는(지우거나 수정 불가) 경우.
+  앞의 패턴들로는 불가능하며, **Proxy** 로 간접 계층을 두어 과거 버전 보존과 최신 단일 노출을 동시에 달성.
+
+> 오류 관리와 멱등성은 데이터 엔지니어링의 **기술적 측면** 을 다룸 — 둘만으로는 의미 있는 데이터셋을 만들지 못함.
+> 비즈니스 가치를 끌어올리려면 다음 챕터의 **데이터 가치(Data Value) 디자인 패턴** 이 필요함.
+> (→ [챕터 5: 데이터 가치 디자인 패턴](../CH05-데이터%20가치%20디자인%20패턴/CH05-tek.md))
