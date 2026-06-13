@@ -264,3 +264,341 @@ SELECT
 FROM input_visits
 
 ```
+
+## 패턴 #26: 메타데이터 데코레이터
+
+### 5.2.5 문제
+
+- 유지보수를 단순화하려면 생성된 각 레코드에 잡 버전 같은 기술적 컨텍스트를 추가해야 함
+- 하지만 이 정보를 최종 사용자에게 보내는 레코드에는 포함하고 싶지 않음
+
+### 5.2.6 해결책
+
+데이터 스토어의 메타데이터 계층을 활용하여 메타데이터 데코레이터 패턴 적용
+
+래퍼와 메타데이터  시맨틱의 차이점: 메타데이터의 노출 여부 
+
+- 메타데이터 지원:
+    - 작성된 각 레코드를 전용 메타데이터 속성과 연결 가능(키-값)
+    - 객체 스토어를 사용할 때 주어진 파일의 모든 레코드에 적용된다면 메타데이터 속성을 해당 파일과 관련된 태그로 정의 가능
+- 메타데이터 미지원:
+    - RDBMS, NoSQL 등
+    - 메타데이터를 데이터 부분에 포함시켜 데코레이션 효과를 시뮬레이션 할 수 있음
+    - 각 레코드의 메타데이터를 개별적으로 추적하고 싶다면 이를 전용 컬럼에 쓰고 이 기술적 정보가 없는 뷰에서 테이블을 노출하거나 해당 컬럼을 조회하지 못하도록 권한 사용 가능
+- 처리 컨텍스트를 데이터셋과 조인할 전용 테이블에 저장 가능 → 스키마에 이 테이블을 숨기는 방법이라 훨씬 간단
+
+### 5.2.7 결과
+
+#### 1. 구현
+
+- 스트리밍 브로커도 네이티브 메타데이터 지원이 부족하여 구현 불가능할 수 있음 - 키네시스
+- 테이블 데이터셋에서의 구현도 메타데이터 정보를 처리하기 위해 추가 컬럼이나 테이블을 정의해야 하는 등 더 많은 노력 필요
+
+#### 2. 데이터
+
+- 메타데이터에 배송주소나 송장 금액같은 비즈니스 관련 속성을 작성하지 않아야 함 - 컨슈머는 메타데이터 부분을 쿼리하지 않기 때문
+
+### 5.2.8 예제
+
+```sql
+# 파이스파크에서 아파치 카프카에 메타데이터 헤더 추가
+visits_with_metadata = (visits_to_save.withColumn('headers', F.array(
+    F.struct(F.lit('job_version').alias('key'), F.lit(job_version).alias('value')),
+    F.struct(F.lit('batch_version').alias('key'),
+    F.lit(str(batch_number).encode('UTF-8')).alias('value'))
+)))
+(visits_with_metadata.write.format('kafka')
+    .option('kafka.bootstrap.servers', 'localhost:9094')
+    .option('includeHeaders', True).option('topic', 'visits-decorated')
+    .save())
+
+# 메타데이터 테이블 초기화 
+CREATE TABLE dedp.visits_context (
+    execution_date_time TIMESTAMPTZ NOT NULL,
+    loading_time TIMESTAMPTZ NOT NULL,
+    code_version VARCHAR(15) NOT NULL,
+    loading_attempt SMALLINT NOT NULL,
+    PRIMARY KEY (execution_date_time)
+)
+
+# 메타데이터 테이블로 새로운 visits 삽입
+{% set weekly_table = get_weekly_table_name(execution_date) %}
+INSERT INTO dedp.visits_context
+    (execution_date_time, loading_time, code_version, loading_attempt)
+VALUES ('{{ execution_date }}', '{{ dag_run.start_date }}',
+    '{{ params.code_version }}', {{ task_instance.try_number }});
+
+INSERT INTO {{ weekly_table }} (SELECT tmp_devices.*,
+    '{{ execution_date }}' AS visits_context_execution_date_time FROM tmp_devices);
+```
+
+# 5.3 데이터 집계
+
+## 패턴 #27: 분산 집계기
+
+분산 데이터 처리 프레임워크를 활용 - 물리적으로는 독립되지만 논리적으로는 유사한 항목을 결합하는 특징을 가짐
+
+### 5.3.1 문제
+
+- 브론즈 계층에서 원시 방문 이벤트 정리 후 실버 계층에 쓰는 잡 작성
+- 온라인 분석 처리(OLAP) 큐브를 규축하여 모든 방문 데이터를 대시보드 시나리오에 잘 맞는 집계 형식으로 변환 필요
+- 데이터셋은 일별 이벤트 시간 파티션에 저장되고 분석 큐브는 일별 및 주간 뷰를 표현해야 함
+
+### 5.3.2 해결책
+
+빅데이터 시대에는 관련 레코드가 여러 물리적 장소에 분산될 수 있음 → 분산 집계기 패턴이 도움
+
+- 클러스터 사용
+    - 서버들은 개별적으로 전체 입력 데이터셋을 처리할 용량이 충분하지 않지만 작업을 나눠서 처리하기 때문에 전체 입력 데이터셋 처리 가능
+    - 코드 기반 구현은 그룹핑 함수를 사용하여 관련 코드들을 모으고 나중에 그 위에 축소 함수를 적용하는 등 소규머 로컬 데이터셋과 동일하게 유지될 수 있음
+    - 전체 데이터셋을 그대로 결합할 수도 있음 - 전체 레코드 수를 구하거나 모든 레코드에 걸쳐 전역 평균을 구하는 경우
+- 주의점:
+    - 셔플: 서로 다른 장비에 처음 적재된 레코드를 네트워크를 통해 교환하는 단계
+    - 모든 레코드 교환이 원시 형태로 이루어지는 것은 아니며 부분 생성을 지원하는 모든 집계는 셔플 전에 로컬에서 부분 집계를 수행하여 최적화 가능 → 계수 연산 사용
+
+### 5.3.3 결과
+
+#### 1. 추가적인 네트워크 교환
+
+- 셔플이 두 번 발생:
+    - 입력 데이터를 각 노드에 전달
+    - 분산 집계기 패턴에서 수행 - 지연 문제 야기하지만 특정 조건에서는 해당 셔플을 피할 수 있음(로컬 집계기 패턴)
+
+#### 2. 데이터 스큐
+
+- 데이터 스큐: 특정 키가 다른 키들보다 발생 빈도가 훨씬 큰 불균형 데이터셋
+
+스큐를 방지하는 방법
+
+- 솔팅: 그룹핑 키에 추가 값을 더하고 솔트가 추가된 컬럼에서 첫 번째 그룹핑 연산을 수행하는 방식
+    - 원래 그룹핑 키의 결과를 얻고 싶다면 솔트가 추가된 컬럼의 집계 결과 재집계 필요
+- AQE(Adaptive Query Execution)
+
+#### 3. 확장
+
+- 노드가 계획된 모든 리듀스 작업을 완료해도 내결함성을 이유로 하드웨어 계층에서 여전히 사용 가능
+- 연산 실패로 재시작 시 해당 데이터는 다시 셔플할 필요가 없지만 실패가 없다면 해당 노드는 계속 존재, 처리 작업이 실행중인 한 회수되지 않음
+- 셔플서비스를 통해 해당 문제 해결 가능
+    - 셔플 서비스: 오직 셔플 데이터를 저장하고 서빙하는 추가 컴퓨팅 구성 요소
+    - 노드를 더 이상 사용하지 않으면 잡이 아직 실행 중일 때도 컴퓨팅 계층이 언제든지 노드 해제 가능
+    - 아파치 스파크의 External Shuffle Servie
+    - GCP 데이터 플로의 Shuffle
+
+### 5.3.4 예제
+
+```sql
+# 스큐가 발생한 컬럼 column_a에 대한 파이스파크의 솔팅
+dataset.withColumn('salt', (rand()*3).cast("int"))
+    .groupBy('group_key', 'salt').agg(...)
+    .groupBy('group_key').agg(...)
+
+# 파이스파크에서 물리적으로 독립된 두 데이터 스토어의 집계
+visits: DataFrame = spark_session.read.json(f'{base_dir}/input-visits')
+devices: DataFrame = spark_session.read.jdbc(url='jdbc:postgresql:dedp',
+    table='dedp.devices', properties={'user': 'dedp_test',
+    'password': 'dedp_test', 'driver': 'org.postgresql.Driver'})
+visits_with_devices = visits.join(devices,
+    [devices.type == visits.context.technical.dev_type,
+     devices.version == visits.context.technical.dev_version],
+    'inner')
+```
+
+- 셔플이 포함되었는지 확인하는 방법 - explain() 사용 후 Exchange hashpartitioning 노드 확인
+- 해당 패턴은 서로 다른 스토리지 위치에서 데이터셋을 조회할 수 잇는 데이터베이스에 적용 가능
+    - 외부 테이블(external table)로 선언하고 쿼리에서 일반적인 객체처럼 참고하여 사용 - GCP의 GCS, AWS 레드시프트, 애저 시냅스 애널리틱스, 스노우플레이크 등
+
+## 패턴 #28: 로컬 집계기
+
+### 5.3.5 문제
+
+- 스트리밍 잡은 파티셔닝된 스트리밍 브로커에 저장된 방문의 윈도를 생성
+- 데이터 양이 정적, 기본적인 파티션에 갑작스러운 변형이나 변화 예상 되지 않음 → 파티션 수 변경 없음
+- 잡 최적화 , 데이터 처리 프레임워크에 의해 자동으로 추가되는 그룹핑 셔플 단계 제거 필요
+
+### 5.3.6 해결책
+
+- 로컬 집계기 패턴은 비용이 많이 드는 셔플, 정적 데이터 원천 파티셔닝, 관련 속성의 공동 저장에 용이
+- 장점
+    - 일부 집계를 여전히 수행하지만 그 집계를 입력 데이터를 조회하는 단일 네트워크 교환으로 로컬에서 수행
+    - 태스크가 완전히 독립적: 다른 태스크의 데이터를 기다릴 필요 없이 바로 진행 가능
+- 구현은 프로듀서 측에서 중점
+    - 특정 그룹핑 키를 가진 레코드가 동일한 물리적 파티션에 기록되도록 보장 필요
+    - 정적 레코드별 파티션 키와 불변의 파티션 수를 통해 달성 가능
+- 카프카 스트림의 groupByKey
+- 아파치 스파크의 mapPartitions, foreachPartition
+    - 그 외에도 동일한 키와 동일한 수의 버킷에 저장된 데이터셋에 대해서는 셔플을 피하는 기능이 있음
+
+— 버킷: 버킷팅(클러스터링)은 파티션을 분할하는 방법
+
+### 5.3.7 결과
+
+#### 1. 확장
+
+- 데이터 원천의 정적인 본질과 일관된 파티셔닝에 의존 - 주어진 키가 항상 하나의 처리 파티션에만 가용성 보장
+- 조직 확장 및 조정 시 - 전용 데이터 스토리지 재구성 작업을 통해 모든 레코드의 파티션 할당을 새로 생성해야해서 비용이 많이 들 수 있음
+    - 스트리밍에 적용하기는 좀 더 어려움 → 운영환경에서 데이터 프로듀서가 새롭게 구성된 파티션에 레코드를 작성하기 전에 이전 파티션의 모든 잔여 데이터를 처리하기 위해 모든 것을 중단하는 이벤트(stop-the-world)가 필요하기 때문
+
+#### 2. 그룹핑 키
+
+- 해당 패턴은 파티션 수가 정적인 파티션된 데이터 원천에서 모든 컨슈머가 공통의 그룹핑 키 로직을 사용하길 기대 → 실제로는 동일한 레코드를 여러 장소에 각각 다른 그룹핑 키로 작성
+- 예를 들어, A는 변경 유형별로 그룹화 B는 사용자ID 기반 집계
+
+### 5.3.8 예제
+
+```sql
+# 카프카 스트림에서의 로컬 집계
+KStream<String, String> visitsSource = streamsBuilder.stream("visits");
+KGroupedStream<String, String> groupedVisits = visitsSource.groupByKey();
+KStream<String, AggregatedVisits> aggregatedVisits = groupedVisits
+    .aggregate(AggregatedVisits::new, new AggregatedVisitsAggregator(),
+        Materialized.with(Serdes.String(), new JsonSerializer<>())).toStream();
+aggregatedVisits.to("visits-aggregated", Produced.with(new Serdes.StringSerde(),
+    new JsonSerializer<>()));
+
+# 파이스파크에서 방문을 위한 로컬 집계 
+sorted_visits: DataFrame = (visits_to_save
+    .sortWithinPartitions(['visit_id', 'event_time']))
+def write_records_from_spark_partition_to_kafka_topic(visits):
+    kafka_writer = KafkaWriter(...)
+    for visit in visits:
+        kafka_writer.process(visit)
+    kafka_writer.close()
+
+sorted_visits.foreachPartition(write_records_from_spark_partition_to_kafka_topic)
+
+# 파이스파크에서 방문을 위한 로컬 집계기: 파티션 기반 작성자
+class KafkaWriter:
+    def __init__(self, bootstrap_server: str, output_topic: str):
+        self.in_flight_visit = {'visit_id': None}
+
+    def process(self, row):
+        if row.visit_id != self.in_flight_visit['visit_id']:
+            send_visit_to_kafka(self.in_flight_visit)
+            self.in_flight_visit = {'visit_id': row.visit_id, 'pages': [],...}
+
+        self.in_flight_visit['pages'].append(row.page)
+    # ...
+
+```
+
+# 5.4 세션화
+
+## 패턴 #29: 증분 세션화 처리기
+
+### 5.4.1 문제
+
+- 세션시간 두시간
+- 방문 세션의 일반적인 지속 시간은 몇분 ~ 세시간이라고 할때 한번의 방문은 최대 세개의 다른 파티션에 걸쳐 확산
+
+### 5.4.2 해결책
+
+아래 세가지로 스토리지 공간 분리 필요
+
+- 입력 데이터셋 스토리지 - 원시 이벤트 저장
+- 완료된 세션 스토리지
+    - 완료된 세션 기록, 진행 중인 세션도 기록될 수 있지만 이상적으로는 완료된 세션과 구별되어야 함(is_final = false 등으로 구분 가능)
+- 대기 중인 세션 스토리지
+    - 실행 중 하나에서 닫히게 될 여러 파티션에 걸쳐 있는 세션 모두 저장
+    - 완료된 세션 스토리지와의 차이는 개발자 전용공간, 세션의 데이터 형식이 완료된 세션 스토리지의 형식과 다를 수 있음
+    - 처리 로직을 정의할 때 멱등성 보장 등을 이유로 실행 ID와 같은 기술 세부 사항이나 내부 세부 사항을 포함할 수 있음
+
+워크플로 로직
+
+- 진행 중인 세션이 없는 특정 엔티티를 위해 생성되는 신규 세션
+- 조회 입력에서 새 데이터가 오는 복원된 세션
+- 새로운 세션 데이터가 없는 복원된 세션 - 해당 세션은 정의한 만료 규칙에 따라 이번 실행 또는 다음 실행에서 세션이 만료될 가능성이 높음
+
+위의 조합을 완료하면 처리할 세션 데이터를 얻게 되는데 이는 이전 레코드와 새 레코드로 구성될 수 있으며 세 가지 상태를 정의하는 세션화 로직을 적용해야 함
+
+- 초기화: 세션 시작
+- 축적: 세션이 활성 상태일 때 - 방문한 페이지를 순서대로 스토리지에 저장하는 방법 등
+- 완료: 세션 중지
+
+```mermaid
+graph LR
+    %% 스타일 정의
+    classDef storage fill:#555555,stroke:#333,stroke-width:1px,color:white;
+    classDef process fill:#E0E0E0,stroke:#333,stroke-width:1px,color:black;
+
+    %% 노드 선언 (줄바꿈은 큰따옴표 안에서 처리)
+    N1[("입력 데이터셋")]:::storage
+    N2[("대기 중인 세션")]:::storage
+    
+    N3["처리기 로직<br>------------------<br>• 세션 생성<br>• 새로운 데이터로 세션 복원<br>• 새로운 데이터 없이 세션 복원<br>• 세션 종료"]:::process
+    
+    N4[("출력 세션")]:::storage
+
+    %% 데이터 흐름 연결
+    N1 --> N3
+    N2 --> N3
+    N3 -- "완료된 세션" --> N4
+    N3 -- "시작되었지만 완료되지 않은 세션" --> N2
+
+    %% 정렬을 위한 서브그래프 설정 (입력 데이터들을 수직 배치)
+    subgraph Input_Stores ["배치 입력"]
+        direction TB
+        N1
+        N2
+    end
+    
+    %% 서브그래프 디자인 설정
+    style Input_Stores fill:none,stroke:#cccccc,stroke-dasharray: 5 5;
+
+```
+
+### 5.4.3 결과
+
+#### 1. 비활성 기간
+
+- 비활성 기간은 세션을 얼마나 오래 열어둘 수 있을지를 정의하는데 길어질수록 세션에 더 오래된 지연 데이터를 포함할 수 있는 반면 더 많은 컴퓨팅 자원과 스토리지 자원이 필요
+- 세션이 완전히 끝나지 않았더라도 중간 결과를 부분 세션 뷰로 내보낼 수 있는데 나중에 데이터가 바뀌면 컨슈머가 혼란스러울 수 있으므로 플래그(is_completed: false)를 사용 권장
+
+#### 2. 데이터 최신성
+
+- 배치 파이프라인에서 동작하는 경우가 많기 때문에 인사이트가 실시간에 비해 매우 늦게 도출
+
+#### 3. 지연 데이터, 이벤트 시간 파티션, 백필링
+
+- 세션화 로직이 이벤트 기간 파티셔닝에 의존한다면, 이미 처리된 파티션에 대한 세션을 놓칠 수 있어 지연 데이터가 문제
+- 의존성이 있는 경우 백필링 시, 하나의 파티션에 대해 세션 생성 로직을 다시 실행하면 이후 모든 파티션에 대해서도 동일 작업을 해줘야 함 → 비용 부담 증가
+- 전용 백필 파이프라인에서 엔티티를 찾아 백필하고 그것들만 다시 실행하는 방법은 비용 최적화, 복잡성 증가라는 트레이드 오프
+
+### 5.4.4 예제
+
+```sql
+# 증분 세션화 처리기를 위한 멱등성 컴포넌트
+DELETE FROM dedp.sessions WHERE execution_time_id >= '{{ ds }}';
+DELETE FROM dedp.pending_sessions WHERE execution_time_id >= '{{ ds }}';
+
+# 세션 생성: 새로운 데이터 적재
+CREATE TEMPORARY TABLE visits_{{ ds_nodash }} (# ...);
+
+COPY visits_{{ ds_nodash }} FROM '/data_to_load/date={{ ds_nodash }}/dataset.csv' CSV
+
+# 새션 생성: 로직
+CREATE TEMPORARY TABLE sessions_to_classify AS
+    SELECT
+        SELECT
+            COALESCE(p.session_id, n.session_id) AS session_id,
+            # ...
+            LEAST(p.start_time, n.start_time) AS start_time,
+            GREATEST(p.last_visit_time, n.start_time) AS last_visit_time,
+            ARRAY_CAT(p.pages, n.pages) AS pages,
+            CASE
+                WHEN n.user_id IS NULL THEN p.expiration_batch_id
+                ELSE '{{ macros.ds_add(ds, 2) }}'
+            END AS expiration_batch_id
+        FROM (SELECT ... FROM visits_{{ ds_nodash }} )
+        WINDOW visits_window AS (PARTITION BY visit_id, user_id ORDER BY event_time)
+    ) AS n
+    FULL OUTER JOIN (
+        SELECT ... FROM dedp.pending_sessions WHERE execution_time_id = '{{ prev_ds }}'
+    ) AS p ON n.session_id = p.session_id;
+
+# 세션 생성: 쓰기 컴포넌트 
+INSERT INTO dedp.pending_sessions (...)
+    SELECT ... FROM sessions_to_classify WHERE expiration_batch_id != '{{ ds }}';
+INSERT INTO dedp.sessions (...)
+    SELECT ... FROM sessions_to_classify WHERE expiration_batch_id = '{{ ds }}';
+
+```
