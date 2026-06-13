@@ -512,6 +512,7 @@ DISTSTYLE ALL;
 <br><br><br>
 
 
+
 ## 5.4 세션화(Sessionization)
 
 - 패턴#29 증분 세션화기(Incremental Sessionizer)
@@ -530,17 +531,11 @@ DISTSTYLE ALL;
 
 ### (1)문제상황
 
-데이터 수집팀이 `visits` 이벤트를 시간(hour) 단위 파티션으로 저장한다.
+- `visits` 이벤트가 시간 단위 파티션으로 저장됨 (`hour=09`, `hour=10`, ...)
+- 세션 정의: 첫 방문 시작, 2시간 동안 추가 방문 없으면 종료
+- 세션 길이 몇 분~3시간 → 세션 1개가 최대 3개 시간 파티션에 걸침
 
-```
-s3://bucket/visits/hour=09/...
-s3://bucket/visits/hour=10/...
-s3://bucket/visits/hour=11/...
-```
-
-세션 정의: 첫 방문에서 시작하고, 2시간 동안 추가 방문이 없으면 종료. 일반적인 세션 길이는 몇 분~3시간이라서, 하나의 세션이 최대 3개의 시간 파티션에 걸칠 수 있다.
-
-구체적 데이터:
+데이터 예시:
 
 |visit_id|user_id|event_time|page|
 |---|---|---|---|
@@ -548,114 +543,99 @@ s3://bucket/visits/hour=11/...
 |v2001|u123|10:05|/products|
 |v2001|u123|10:40|/cart|
 
-- `hour=09` 파티션에는 `v2001`의 09:50 이벤트만 있음
-- `hour=10` 파티션에는 `v2001`의 10:05, 10:40 이벤트가 있음
+- `hour=09` 파티션: v2001의 09:50만 있음
+- `hour=10` 파티션: v2001의 10:05, 10:40만 있음
+- `hour=10`만 처리하면 세션 시작점(09:50, /home)을 모름
+- 정확한 세션을 만들려면 `hour=09`도 같이 봐야 함
+- 매번 몇 시간 전 파티션까지 다시 읽어야 하는지 알 방법이 없어서, 분석팀이 매번 여러 연속 파티션을 재처리해야 했음
 
-`hour=10` 파티션만 처리하면, `v2001` 세션의 시작점(09:50, `/home`)을 모른 채로 세션을 만들게 된다. 정확한 세션을 만들려면 `hour=09`도 같이 봐야 하는데, 매 실행마다 "이 유저의 세션이 몇 시간 전 파티션부터 시작됐는지" 알 방법이 없어서, 분석팀은 매번 여러 개의 연속 파티션을 다시 훑어야 했다.
-
-질문: 매번 과거 파티션을 전부 다시 읽지 않고, "이전 실행에서 아직 안 끝난 세션"만 이어받아서 처리할 수 없을까?
+질문: 과거 파티션을 매번 다 읽지 않고, "이전 실행에서 안 끝난 세션"만 이어받을 수 없을까?
 
 ### (2)솔루션
 
-주요컨셉: 패턴#02 증분 로더(Incremental Loader)와 같은 방식으로, 이번 실행의 입력 데이터에 "이전 실행에서 아직 끝나지 않은 세션(pending session)"을 합쳐서 처리한다.
+주요컨셉: "입력/완료/대기"는 실제 테이블 3개고, 매 실행마다 이 3개 사이에서 데이터를 옮긴다.
 
-필요한 저장 공간 3개:
+- 입력 데이터 - S3의 시간별 raw `visits` 파일 (기존 데이터, 새로 안 만듦)
+- 완료 테이블(`dedp.sessions`) - 종료된 세션만, 분석팀 조회용
+- 대기 테이블(`dedp.pending_sessions`) - 비활성 기간(2시간) 안 지난 세션, 기술팀 전용 (패턴#26과 동일한 접근제어 방식)
 
-- 입력 데이터 저장소(Input dataset storage) - `hour=09`, `hour=10`처럼 시간 단위로 파티션된 raw `visits`
-- 완료된 세션 저장소(Completed sessions storage) - 종료된 세션만 저장. 최종 사용자에게 공개되는 공간
-- 대기 중인 세션 저장소(Pending sessions storage) - 아직 비활성 기간(2시간)이 안 지나서 종료 안 된 세션. 기술팀 내부 전용 공간 (예: `is_final=false`로 구분, 또는 별도 테이블)
+매 실행 흐름:
 
-매 실행마다 다음 3가지 결과 중 하나로 분류된다.
+- 1. 이번 시간 파티션의 raw `visits` 읽기
+- 2. `pending_sessions`에서 같은 `visit_id`의 미완료 세션 조회
+- 3. 둘을 합쳐서 세션 갱신 (시작시간/마지막방문시간/페이지목록)
+- 4. 만료 판단 (`last_visit_time` + 2시간 경과 여부)
+    
+    - 만료 → `sessions`(완료)에 저장
+    - 미만료 → `pending_sessions`(대기)에 다시 저장
 
-- 신규 세션 - 해당 `visit_id`(session entity)에 대한 pending session이 없음 → 새로 시작
-- 갱신된 세션 - pending session이 있고, 이번 입력에 새 이벤트가 있음 → 이벤트 추가
-- 그대로 대기 중인 세션 - pending session은 있지만 이번 입력에 새 이벤트가 없음 → 다음 실행에서 만료 여부 재판단
+핵심:
 
-`hour=10` 실행 시점의 데이터 흐름:
+- `hour=09` 실행 → `pending_sessions`에 v2001 row 1개 저장: `{start: 09:50, last: 09:50, pages: [/home]}`
+- `hour=10` 실행 → 그 row를 다시 읽어서 갱신 → 만료 안 됐으면 `pending_sessions`에 재저장
+- 즉 "이전 실행 상태"는 메모리 캐시가 아니라 DB 테이블의 row로 전달됨
 
-|단계|내용|
-|---|---|
-|입력|`hour=10`의 v2001 이벤트 2개 (10:05, 10:40)|
-|pending session storage 조회|v2001의 pending session 발견: `{start_time: 09:50, last_visit_time: 09:50, pages: [/home]}`|
-|결합 결과|`{start_time: 09:50, last_visit_time: 10:40, pages: [/home, /products, /cart]}`|
-|만료 판단|`last_visit_time(10:40)` 기준 2시간(=12:40)까지 신규 이벤트 없으면 완료 → `hour=12` 실행 시점에 completed로 이동|
+재실행(idempotency):
 
-Airflow + SQL 구현. 먼저 이번 실행(및 이후 재실행) 결과를 정리하는 idempotency 단계:
-
-```sql
-DELETE FROM dedp.sessions WHERE execution_time_id >= '{{ ds }}';
-DELETE FROM dedp.pending_sessions WHERE execution_time_id >= '{{ ds }}';
--- ★핵심: 재실행(backfill) 시 중복 생성을 막기 위해, 이번 실행 시점 이후로 만들어진
---        completed/pending 세션을 먼저 삭제하고 다시 만든다 (패턴#16 빠른 메타데이터 정리기와 동일한 사고방식)
-```
-
-입력 데이터 로드:
-
-```sql
-CREATE TEMPORARY TABLE visits_{{ ds_nodash }} (...);
-COPY visits_{{ ds_nodash }} FROM '/data_to_load/date={{ ds_nodash }}/dataset.csv' CSV;
-```
-
-입력 데이터 + pending session 결합:
-
-```sql
-CREATE TEMPORARY TABLE sessions_to_classify AS
-SELECT
-    COALESCE(p.session_id, n.session_id) AS session_id,
-    LEAST(p.start_time, n.start_time) AS start_time,
-    GREATEST(p.last_visit_time, n.start_time) AS last_visit_time,
-    ARRAY_CAT(p.pages, n.pages) AS pages,
-    CASE
-        WHEN n.user_id IS NULL THEN p.expiration_batch_id
-        ELSE '{{ macros.ds_add(ds, 2) }}'
-    END AS expiration_batch_id
-FROM (
-    SELECT ... FROM visits_{{ ds_nodash }}
-    WINDOW visits_window AS (PARTITION BY visit_id, user_id ORDER BY event_time)
-) AS n
-FULL OUTER JOIN (
-    SELECT ... FROM dedp.pending_sessions WHERE execution_time_id = '{{ prev_ds }}'
-) AS p ON n.session_id = p.session_id;
--- ★핵심: FULL OUTER JOIN으로 "신규 세션 / 갱신된 세션 / 새 이벤트 없는 pending 세션" 3케이스를 한 쿼리에서 처리.
---        COALESCE, LEAST/GREATEST, ARRAY_CAT으로 시작시간/마지막방문시간/페이지목록을 병합한다.
-```
-
-결과를 completed/pending으로 나눠서 쓰기:
-
-sql
-
-```sql
-INSERT INTO dedp.pending_sessions (...)
-    SELECT ... FROM sessions_to_classify WHERE expiration_batch_id != '{{ ds }}';
-
-INSERT INTO dedp.sessions (...)
-    SELECT ... FROM sessions_to_classify WHERE expiration_batch_id = '{{ ds }}';
--- ★핵심: expiration_batch_id(만료 예정 시점)가 이번 실행 시점과 같으면 "완료"로,
---        다르면(아직 안 됐으면) "대기"로 분기해서 두 저장소에 나눠 쓴다.
-```
+- 이번 실행 시점 이후로 만들어진 row를 먼저 삭제 후 재생성 (패턴#16과 동일한 사고방식)
+- 재실행해도 중복 row 안 생기게 보장
 
 ### (3)결과
 
-- 비활성 기간(inactivity period) 길이의 트레이드오프
-    - 길게 잡으면: 늦게 들어온 이벤트도 세션에 포함 가능 → 정확도 ↑
-    - 길게 잡으면: pending 상태로 더 오래 보관해야 함 → 컴퓨팅/스토리지 비용 ↑
-    - 비즈니스 요구사항에 맞춰 균형 필요
-- 부분 세션(partial session) 노출 시 일관성 위험
-    - 비활성 기간이 길어서 완료까지 기다리기 부담스러우면, 미완성 세션을 completed storage에 먼저 내보낼 수 있음
-    - 이 경우 `is_completed: false` 같은 플래그 필수 - 컨슈머가 "최종 상태"로 잘못 판단하면 (예: 사기 탐지에서 1차 파티션 처리 후 "안전"으로 분류됐다가 2차 파티션에서 "위험"으로 바뀌는 케이스) 잘못된 의사결정으로 이어짐
-- 늦은 데이터(late data) + event time 파티션의 forward dependency
-    - 09시 파티션의 세션 결과가 10시 파티션 처리에 영향을 주고, 10시 결과가 11시에 영향을 줌 - 즉 순차적으로 의존
-    - 09시 파티션에 late data가 들어와서 재처리(backfill)하면, 그 이후 모든 파티션(10시, 11시, ...)도 다시 처리해야 함 → 비용이 빠르게 커짐
-    - 대응: 전부 재처리(단순하지만 비쌈) vs 영향받는 entity만 탐지해서 재처리(복잡하지만 비용 절감) - 둘 다 트레이드오프, 정답 없음
+- 비활성 기간 길이의 트레이드오프
+    - 길게: late data 포함 가능 → 정확도 ↑
+    - 길게: `pending_sessions`에 더 오래 머무름 → 비용 ↑
+- 부분 세션 노출 시 일관성 위험
+    - 완료 전 미완성 세션을 먼저 노출할 경우 `is_completed: false` 플래그 필수
+    - 예: 사기 탐지에서 1차 파티션은 "안전" → 2차 파티션에서 "위험"으로 바뀜. 플래그 없으면 컨슈머가 1차 결과를 최종으로 오판
+- late data + forward dependency
+    - `hour=09` 결과가 `hour=10`에 영향, `hour=10`이 `hour=11`에 영향 (순차 의존)
+    - `hour=09`에 late data 들어와서 재처리하면 이후 모든 파티션도 재처리 필요 → 비용 급증
+    - 대응: 전체 재처리(단순/비쌈) vs 영향받는 entity만 탐지 후 재처리(복잡/저비용) - 트레이드오프
 
 ### (4)예시
 
 엔지니어 독백:
 
-> 분석팀이 "유저별 방문 세션 테이블 만들어달라"고 했을 때, 처음엔 매일 지난 3시간 파티션을 다 읽어서 세션을 다시 만드는 식으로 짰어. 근데 데이터량이 늘면서 점점 느려졌지. pending_sessions 테이블을 두고 "어제 끝나지 않은 세션만 이어받는" 방식으로 바꾸니까, 매 실행마다 읽는 데이터량이 확 줄었어. 다만 나중에 09시 파티션에 1시간 늦게 들어온 이벤트가 있었는데, 그게 09시뿐 아니라 10시, 11시 세션까지 영향을 준다는 걸 처음엔 몰라서 한참 디버깅했어.
+> 처음엔 매일 지난 3시간 파티션을 통째로 다시 읽어서 세션을 만들었는데, 데이터량 늘면서 느려졌어. `pending_sessions` 테이블 두고 "안 끝난 세션만 이어받는" 방식으로 바꾸니 매 실행 읽는 양이 확 줄었어. 다만 09시 파티션에 1시간 늦은 이벤트가 들어왔을 때, 그게 10시·11시 세션까지 영향 준다는 걸 처음엔 몰라서 한참 헤맸어.
+
+DAG 흐름 (이번 실행 정리 → 입력 로드 → pending과 결합 → 완료/대기 분기 저장):
+
+sql
+
+```sql
+-- 1) 재실행 대비: 이번 실행 이후 생성된 row 정리
+DELETE FROM dedp.sessions WHERE execution_time_id >= '{{ ds }}';
+DELETE FROM dedp.pending_sessions WHERE execution_time_id >= '{{ ds }}';
+
+-- 2) 이번 시간 파티션 입력 로드
+CREATE TEMPORARY TABLE visits_now AS
+SELECT * FROM raw_visits WHERE hour = '{{ ds_nodash }}';
+
+-- 3) 입력 + pending 결합 (신규/갱신/대기유지 케이스를 FULL OUTER JOIN으로 한번에)
+CREATE TEMPORARY TABLE sessions_to_classify AS
+SELECT
+    COALESCE(p.session_id, n.session_id) AS session_id,
+    LEAST(p.start_time, n.event_time) AS start_time,
+    GREATEST(p.last_visit_time, n.event_time) AS last_visit_time,
+    ARRAY_CAT(p.pages, n.pages) AS pages,
+    CASE WHEN n.session_id IS NULL THEN p.expiration_batch_id
+         ELSE '{{ macros.ds_add(ds, 2) }}' END AS expiration_batch_id
+FROM visits_now n
+FULL OUTER JOIN dedp.pending_sessions p ON p.session_id = n.visit_id;
+
+-- 4) 만료 여부로 완료/대기 분기 저장
+INSERT INTO dedp.sessions
+    SELECT * FROM sessions_to_classify WHERE expiration_batch_id = '{{ ds }}';
+
+INSERT INTO dedp.pending_sessions
+    SELECT * FROM sessions_to_classify WHERE expiration_batch_id != '{{ ds }}';
+```
 
 ### (5)최신트렌드
 
-- dbt incremental 모델 + `is_incremental()` - pending/completed 분리 로직을 dbt 모델로 표현하고, `MERGE`(패턴#18 병합기와 동일한 개념)로 pending 세션을 업데이트
-- Delta Lake `MERGE INTO` - `pending_sessions` 테이블에 대해 신규/갱신/만료 세션을 한 번의 `MERGE` 문으로 처리해서, INSERT/DELETE를 따로 관리하는 부담을 줄임
-- 배치-스트림 통합(Lakehouse 아키텍처) - 애초에 배치로 시간 단위 세션화를 하는 대신, 패턴#30 상태 저장 세션화기(Stateful Sessionizer)처럼 스트리밍 + state store로 전환하는 흐름이 늘어남. 다음 패턴이 바로 그 대안이다
+- dbt incremental + `MERGE` - pending/completed 분리를 dbt 모델로 표현, `MERGE INTO`(패턴#18)로 `pending_sessions` 갱신
+- Delta Lake `MERGE INTO` - 신규/갱신/만료를 한 문장으로 처리, INSERT/DELETE 분리 관리 부담 감소
+- Lakehouse 배치-스트림 통합 - 시간 단위 배치 세션화 대신 패턴#30(상태 저장 세션화기)처럼 스트리밍+state store로 전환하는 추세
+
+
