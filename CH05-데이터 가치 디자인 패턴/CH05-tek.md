@@ -20,9 +20,13 @@
 4. [세션화 (Sessionization)](#4-세션화-sessionization)
    - 패턴 #29: 증분 세션화 처리기 (Incremental Sessionizer)
    - 패턴 #30: 상태 저장 세션화 처리기 (Stateful Sessionizer)
+5. [데이터 정렬 (Data Ordering)](#5-데이터-정렬-data-ordering)
+   - 패턴 #31: 빈 팩 정렬기 (Bin Pack Orderer)
+   - 패턴 #32: 선입 선출 정렬기 (FIFO Orderer)
+6. [요약 (Summary)](#6-요약-summary)
 
-> 본 문서가 다루는 범위는 챕터 5 중 **#23~#30** (5.1 Data Enrichment + 5.2 Data Decoration + 5.3 Aggregation + 5.4 Sessionization).
-> 나머지(5.5 Data Ordering — #31 Bin Pack / #32 FIFO Orderer)는 후속 문서에서 다룸.
+> 본 문서가 챕터 5 **전체(#23~#32)** 를 다룸 — 5.1 Data Enrichment · 5.2 Data Decoration · 5.3 Aggregation · 5.4 Sessionization · 5.5 Data Ordering.
+> 챕터 6(데이터 흐름 #33~)은 별도 문서에서 다룸.
 
 ---
 
@@ -46,7 +50,7 @@
  5.4 Sessionization    "이벤트를 세션으로 묶음"  → #29 Incremental / #30 Stateful Sessionizer
  5.5 Data Ordering     "순서가 중요할 때 정렬"   → #31 Bin Pack / #32 FIFO Orderer
 ==========================================================================
- 본 문서: 5.1 (#23, #24) + 5.2 의 Wrapper (#25)
+ 본 문서: 챕터 5 전체 (#23 ~ #32)
 ```
 
 | 패밀리 | 적용 상황 (언제 쓰나) | 핵심 동작 |
@@ -57,6 +61,33 @@
 > 참고
 > — Data Enrichment(결합)·Data Decoration(개별 속성 계산)은 **소량/문맥 보강** 에 강하지만,
 > 대량 데이터의 **개요(overview)** 가 필요하면 Aggregation·Sessionization 으로 넘어가야 함.
+
+### 패턴 흐름 — 앞 패턴의 한계가 다음 패턴을 부른다 (#29 → #33)
+
+세션화부터 정렬, 그리고 챕터 6 진입까지 **"앞 패턴이 남긴 문제 → 다음 패턴"** 으로 이어지는 narrative.
+
+```
+[패턴 흐름 — 한 패턴의 한계가 다음 패턴을 부른다]
+──────────────────────────────────────────────────────────────────────
+ 세션화 (5.4)
+   #29 Incremental Sessionizer (배치) — 시간별 파티션을 Pending 으로 이어 붙여 세션 완성
+      │ 한계: 배치라 결과가 ~1시간 늦음
+      ▼ "더 빨리(near real-time) 필요"
+   #30 Stateful Sessionizer (스트리밍) — Pending 대신 state store 로 실시간 세션
+      │
+      ▼ "이번엔 이벤트를 순서대로 전달해야"
+ 정렬 (5.5)
+   #31 Bin Pack Orderer — partial commit + bulk 에서도 순서 보존 (bin 으로 묶어 순차 flush)
+      │ 한계: 늘 low latency·대용량인 건 아님
+      ▼ "더 단순하게, ASAP"
+   #32 FIFO Orderer — record 하나씩 ack 받고 전달 (네트워크 효율은 포기)
+      │
+      ▼ "그런데 이 잡들을 어떻게 다 엮지?"  → 챕터 6
+ 데이터 흐름 (Ch6)
+   #33 Local Sequencer (별도 문서 CH06) — 큰 잡을 순서 있는 작은 태스크로 분해
+──────────────────────────────────────────────────────────────────────
+ 핵심 — 각 패턴은 "앞 패턴이 남긴 한계"를 푸는 방향으로 등장함.
+```
 
 ---
 
@@ -1352,6 +1383,33 @@ INSERT INTO dedp.sessions (...)
  간격이 gap duration(20분) 이하면 같은 세션, 초과하면 새 세션이 시작됨.
 ```
 
+**쉽게 풀어 보면** — #30 은 #29(배치)와 **워크플로가 똑같음**. 단 하나, **Pending 저장소가 state store 로** 바뀌고 배치가 스트리밍이 됨.
+새 이벤트가 올 때마다 state store 에서 그 key 의 세션을 꺼내(있으면 재개, 없으면 생성) 이어 붙이고,
+gap(비활동)을 넘으면 방출, 아니면 state store 에 다시 저장하며 주기적으로 checkpoint 백업함.
+
+```
+[쉽게 풀어 보면 — #30 은 실시간 루프 (state store 가 #29 의 Pending 역할)]
+──────────────────────────────────────────────────────────────────────
+ 새 visit 이벤트 도착 (key = visit_id)
+        │
+        ▼
+   state store 조회
+     ├─ 있음 → 세션 재개(resume)
+     └─ 없음 → 세션 생성(create)
+        │
+        ▼
+   새 이벤트 결합 (예: 방문 페이지 누적)
+        │
+        ▼
+   gap(비활동) 넘었나? ── 예 ──►  세션 방출(emit) → 출력, state 제거
+        │ 아니오
+        ▼
+   state store 에 갱신 저장 ──(주기적)──► checkpoint(내구 저장)로 백업
+──────────────────────────────────────────────────────────────────────
+ #29 와 워크플로 동일, "Pending 저장소" 가 "state store" 로 바뀐 실시간 버전.
+ ⚠ 만료는 event time 기준(processing time 은 지연 시 조기 만료 위험), session key 는 불변값(visit_id)으로.
+```
+
 #### 고려사항 (Consequences)
 
 - **At-least-once processing (적어도 한 번 처리)**
@@ -1487,3 +1545,322 @@ sessions: DataStream = (visits_input_data_stream
 > 다른 key 로 들어가 세션이 둘로 쪼개짐. 또 processing time 만료를 쓰면 쓰기 재시도로 5분 지연된 사이
 > 멀쩡한 세션이 **너무 일찍 만료** 돼 페이지 절반이 누락된 세션이 방출됨.
 > session key 는 실행마다 불변인 값(`visit_id` 등)으로 잡고, 만료는 **event time + watermark** 기준으로 둘 것.
+
+---
+
+## 5. 데이터 정렬 (Data Ordering)
+
+집계·결합으로 가치를 더하는 것 말고도, **순서(order)** 자체가 중요한 가치가 됨 —
+이벤트를 시간순(chronological)으로 다운스트림 컨슈머 (받아 쓰는 쪽)에게 전달하는 경우.
+SQL `ORDER BY` 로 줄여 생각하기 쉽지만, **정렬된 전달(ordered delivery)** 은 의외로 까다로움.
+
+> 책의 비유 — 차량 추적 시스템에서 차들의 위치 순서가 어긋나면,
+> 차가 건물을 뛰어넘거나 강을 헤엄치는 것처럼 보임. 그만큼 순서(chronology)가 결정적인 use case 가 많음.
+
+- **#31 Bin Pack Orderer** — **partial commit(부분 커밋)** 저장소에서 bulk 전달을 쓰면서도 순서를 지킬 때.
+- **#32 FIFO Orderer** — low latency·대용량이라 단순함이 우선일 때(네트워크 교환을 희생).
+
+---
+
+### 5-1. 패턴 #31: 빈 팩 정렬기 (Bin Pack Orderer)
+
+> 대규모 정렬 전달의 악몽은 **partial commit** 임. bulk API 의 효율은 살리면서, 부분 커밋이 순서를 깨지 않게 묶어 보내는 패턴.
+
+#### 상황 (Problem)
+
+**책의 use case** — 외부 API 로 노출하는 visit 동기화 잡:
+
+- 블로깅 플랫폼이 외부 사이트에 페이지를 embed → 그 embedding 이 만든 visit 이벤트를 자체 이벤트로 처리.
+  내부 보관뿐 아니라 **외부 API 로도 노출**(분석용)해야 함.
+- 동기화 잡은 **모든 파트너 공통** — **10분 processing time 윈도우** 로 **분당 집계** 를 만들고,
+  끝에 파트너별 다른 출력으로 flush. 이벤트는 **분·파트너별 개별 전달, event time 순서** 여야 함.
+- **결정적 제약**: API 적재 저장소가 **partial commit 시맨틱의 스트리밍 브로커** 라,
+  retry 가 순서를 깰 수 있어 정렬 로직에 각별히 주의해야 함.
+
+> **참고 사항 — Partial Commit (부분 커밋)**
+> 고전적 commit 은 success/failure 두 상태지만, partial commit 은 **세 번째 상태** 가 있음 — record 의 **일부만** 적재.
+> 왜 순서를 깨나? 10:00·10:10·10:20 세 record 를 bulk 로 보내면 DB 가 **전부·둘·하나·없음** 중 무엇이든 쓸 수 있음.
+> 중간 결과(둘·하나)가 위험함 — 어떤 record 가 미전달인지, 언제 성공할지 알 수 없기 때문.
+> 예: 10:20 만 써졌으면 10:00·10:10 을 retry → **순서가 뒤집힌 채** 기록됨.
+> 스트리밍에서 가장 잘 드러나지만 data-at-rest 에서도 중요 — 일시적으로 일부만 빈 데이터셋이 downstream 처리를 잘못 trigger.
+> partial commit 예 — Kinesis `PutRecords`, DynamoDB `BatchWriteItem`, Elasticsearch bulk.
+
+#### 해결 (Solution)
+
+record 를 **개별 전달** 하면 순서는 지키지만 네트워크 오버헤드가 큼(record 수만큼 요청을 초기화).
+bulk operation 에 **Bin Pack Orderer** 를 결합하면, partial commit 맥락에서도 순서를 보장하면서 bulk 의 효율을 살림.
+
+두 단계로 동작함.
+- **① 정렬** — 관련 이벤트를 모아 **grouping key + event time 으로 sort**.
+- **② bin packing** — 정렬된 row 를 **delivery bin 으로 묶되, 한 bin 에 grouping key 가 하나씩만** 오게 함
+  (서로 다른 엔티티의 "같은 순번" 이벤트를 같은 bin 에 모음).
+  ⇒ completeness·중복·partial commit 걱정 없이 bulk API 로 보낼 수 있는 **격리된 부분집합(isolated subset)** 이 생김.
+
+워크플로:
+- record 를 grouping key·time 으로 정렬.
+- 정렬된 row 를 delivery bin 에 배치 — 각 bin 엔 grouping key 가 **한 번만**. (bin = array/list)
+- bin 을 **순차(sequential) emit**. 한 bin 안에서 retry 가 나도 그 bin 에 국한됨 —
+  bin 당 grouping key 가 한 번만 등장하니 retry 가 그 key 의 순서를 못 깸.
+  현재 bin 이 완전히 쓰이기 전엔 다음 bin 을 안 보냄.
+
+```
+[Figure 5-9 재현] Bin packer — 3개 bulk 요청으로 순서를 지키며 전달
+──────────────────────────────────────────────────────────────────────
+ 입력(정렬 전)        ──ORDER BY key, time──►   정렬 후
+   Key=1  10:00                                  Key=1  09:04
+   Key=2  09:04                                  Key=1  10:00
+   Key=1  09:04                                  Key=1  10:04
+   Key=1  10:04                                  Key=2  09:04
+   Key=3  10:15                                  Key=2  10:00
+   Key=2  10:00                                  Key=3  10:15
+                                                     │ Delivery Bins 생성 (bin 당 key 1회)
+                                                     ▼
+ Delivery Bin 1     Delivery Bin 2     Delivery Bin 3
+ ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+ │ Key=1  09:04 │   │ Key=1  10:00 │   │ Key=1  10:04 │
+ │ Key=2  09:04 │   │ Key=2  10:00 │   └──────────────┘
+ │ Key=3  10:15 │   └──────────────┘
+ └──────────────┘
+       │ ①                │ ②                │ ③
+       └──────────────────┴──────────────────┴────►  [출력 스토어]  flush one by one, in order
+──────────────────────────────────────────────────────────────────────
+ 각 key 의 1·2·3번째 이벤트가 bin 1·2·3 에 흩어짐 → bin 을 순서대로 flush 하면 key 안의 순서가 보존됨.
+ 한 bin 엔 key 가 한 번만 등장 ⇒ 그 bin 의 partial commit·retry 가 key 순서를 깨지 못함.
+```
+
+**쉽게 풀어 보면** — 핵심은 **"한 bulk 요청(=bin) 안에 같은 key 를 두 번 넣지 않는 것"**.
+한 요청에 같은 key 의 여러 이벤트가 섞여 있으면 partial commit 으로 일부만 써지고 나머지가 retry 돼 순서가 뒤집힘.
+key 의 이벤트들을 **서로 다른 bin 에 한 건씩** 흩고 bin 을 순서대로 flush 하면, 한 요청이 부분 실패해도 그 key 순서는 그대로 유지됨.
+
+```
+[쉽게 풀어 보면 — 왜 bin 으로 나누면 partial commit 이 순서를 못 깨나]
+──────────────────────────────────────────────────────────────────────
+ ✗ bin 없이: 한 key 의 3건을 한 bulk 에 담음
+   bulk = [ Key1@09:04, Key1@10:00, Key1@10:04 ]
+   partial commit 으로 10:04 만 성공, 나머지는 나중에 retry
+   ⇒ 10:00 이 10:04 "뒤" 에 기록됨 → 순서 깨짐
+
+ ✓ bin 으로 나눔: 한 key 는 bin 마다 1건씩
+   Bin1 = [ Key1@09:04 … ]   Bin2 = [ Key1@10:00 … ]   Bin3 = [ Key1@10:04 … ]
+   Bin1 이 완전히 성공해야 Bin2 전송 (순차 flush)
+   ⇒ 한 bin 안엔 Key1 이 1번뿐 → 그 bin 이 부분 실패·retry 돼도 Key1 순서는 불변
+──────────────────────────────────────────────────────────────────────
+```
+
+#### 고려사항 (Consequences)
+
+순서 보장에는 좋아 보이지만, compute 런타임이 받쳐주지 않으면 일부 item 이 여전히 어긋날 수 있음.
+
+- **Retries (재시도)**
+  - 패턴은 **같은 실행 내** 에서만 순서를 보장함.
+    파이프라인 전체가 실패해 retry 하면, **이미 emit 된 결과까지 다시** 섞이게 됨 →
+    패턴을 써도 전체 순서가 깨질 수 있음.
+- **Complexity (복잡도)**
+  - bin packer 는 고전적 sort 보다 구현이 확실히 어려움 — 커스텀 정렬·bin 생성 로직이 필요한 반면,
+    고전 정렬은 적절한 정렬 함수 한 번 호출이면 끝.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — bin packer 준비 단계 (Example 5-30, PySpark)**
+
+파티션 내에서 `visit_id`·`event_time` 으로 로컬 정렬(네트워크 교환 없음) 후 파티션별로 Kinesis 전송:
+```python
+(events.sortWithinPartitions([F.col('visit_id'), F.col('event_time')])
+   .foreachPartition(lambda rows: write_records_to_kinesis(...)))
+```
+
+**예시 2 — Kinesis 용 Bin Pack Orderer (Example 5-31)**
+
+정렬된 row 를 돌며, `visit_id` 가 바뀌면 bin 위치를 0으로 리셋해 같은 key 의 연속 등장을 서로 다른 bin 에 배치:
+```python
+def write_records_to_kinesis(output_stream, visits_rows):
+  producer = boto3.client('kinesis')
+  delivery_groups = []
+  groups_index = 0
+  last_visit_id: Optional[str] = None
+  for visit in visits_rows:
+    if visit.visit_id != last_visit_id:   # key 가 바뀌면
+      last_visit_id = visit.visit_id
+      groups_index = 0                     # 다시 bin 0 부터
+    if len(delivery_groups) <= groups_index:
+      delivery_groups.append([])           # 필요한 만큼 bin 생성
+    delivery_groups[groups_index].append(visit)
+    groups_index += 1                       # 같은 key 의 다음 등장은 다음 bin 으로
+```
+
+> 정렬 덕분에 같은 `visit_id` 가 연속으로 나오고, 그 1·2·3번째가 bin 0·1·2 로 흩어짐.
+> 이후 bin 을 0→1→2 순서로 flush 하면 각 key 의 순서가 그대로 지켜짐.
+
+| 항목 | Bin Pack Orderer (#31) | FIFO Orderer (#32) |
+|---|---|---|
+| 전제 | partial commit + bulk 효율 둘 다 필요 | 단순함·ASAP 전달 우선 |
+| 동작 | 정렬 후 bin 으로 묶어 순차 bulk flush | record 하나씩 ack 받고 다음 전송 |
+| 비용 | 구현 복잡, 네트워크 효율↑ | 구현 단순, I/O 오버헤드↑ |
+
+> **트러블 로그** — partial commit 저장소에 bin packing 없이 bulk 로 보내면, 부분 커밋 + retry 로 순서가 뒤집힘.
+> 예: Kinesis `PutRecords` 로 한 차량의 위치 이벤트 10건을 한 번에 보냈는데 3·5번째만 실패 → 그 둘만 retry →
+> 5번째가 6·7번째 **뒤에** 기록돼, 지도에서 차가 뒤로 점프하는 것처럼 보임.
+> 한 bin 에 한 차량의 위치를 **한 건만** 담고 bin 을 순서대로 flush 하면, 한 bin 의 부분 실패가 그 차량 순서를 못 깸.
+
+---
+
+### 5-2. 패턴 #32: 선입 선출 정렬기 (FIFO Orderer)
+
+> Bin Pack Orderer 가 partial commit + bulk 최적화를 노린다면, FIFO Orderer 는 **단순함을 위해 네트워크 효율을 포기** 하는 더 가벼운 대안.
+
+#### 상황 (Problem)
+
+**책의 use case** — ASAP 전달이 필요한 스트리밍 잡:
+
+- visits 에서 특정 이벤트 **subset 을 감지** 해, 처리 순서대로 다른 스트림에 전달하는 스트리밍 잡.
+- **각 record 를 가능한 빨리(ASAP) 전달** 해야 함 → 네트워크를 아끼려는 buffering 은 선택지가 아님.
+- **결정적 제약**: low latency 가 우선이라 bulk·버퍼링을 못 씀 → 가볍고 단순한 순서 보장이 필요.
+
+#### 해결 (Solution)
+
+전달 제약이 더 느슨하다면 Bin Pack 보다 단순한 **FIFO Orderer** 가 맞음.
+정렬 알고리즘이 필요 없음 — 요구가 **first in, first out** 으로 보내는 것뿐이라, record 를 감지해 전달 요청하면 됨.
+
+- 핵심은 **각 record 의 전달 ack 를 받은 뒤 다음으로** 진행하는 것. 안 그러면 순서가 깨지거나 유실됨.
+- 구현은 두 가지.
+  - **개별 전달 API** — Kinesis `PutRecord`, Kafka `send(...)` + 동기 `flush(...)`.
+  - **bulk API + concurrency=1** — full commit 시맨틱 저장소에서만. 동시에 너무 많은 bulk 를 보내지 않게 함
+    (하나라도 실패하면 out of order). Kafka 는 `max.in.flight.requests.per.connection=1`,
+    또는 **idempotent producer**(최대 5 concurrent 를 허용하면서도 순서 보장).
+
+> **참고 사항 — In-Flight Requests (전송 중 요청)**
+> in-flight 요청은 throughput 최적화에 좋음 — 첫 bulk 의 응답을 안 기다리고 다음을 만들어 보냄.
+> 하지만 순서를 깰 수 있음 — 두 in-flight 중 **둘째가 성공하고 첫째가 retry** 되면 그 사이 순서가 깨짐.
+
+**쉽게 풀어 보면** — FIFO 는 **"하나 보내고 그 ack 를 받은 뒤에야 다음을 보내는 것"** — 그래서 정렬 알고리즘 없이도 항상 오래된 것부터 전달됨.
+대신 record 마다 왕복이 생겨 I/O·지연이 커지고, **exactly-once 는 보장하지 못함**(ack 가 실패하면 같은 record 를 재전송 → 중복).
+
+```
+[쉽게 풀어 보면 — FIFO 는 "하나 보내고 ack 받고 다음", 단 중복은 못 막음]
+──────────────────────────────────────────────────────────────────────
+ 정상 흐름 (순서 보장)
+   R1 send → ack ✓ → R2 send → ack ✓ → R3 send → ack ✓
+   (이전 ack 를 받아야 다음 전송 ⇒ 항상 오래된 것부터 = FIFO)
+
+ ✗ exactly-once 는 아님
+   R1 send 성공 → ack 전송 중 실패 → 잡 재시작
+   ⇒ producer 가 R1 을 "미전달" 로 보고 재전송 → R1 중복
+   완화: 챕터 4 멱등성 패턴(중복을 무해하게)
+──────────────────────────────────────────────────────────────────────
+ 순서는 지키지만 record 마다 왕복(ack)이라 I/O·지연↑ → 멀티스레딩 시 엔티티별로 scope 를 고정할 것.
+```
+
+#### 고려사항 (Consequences)
+
+단순함이 매력이지만, FIFO 전달이 걸린 모든 use case 에 무턱대고 쓸 건 아님.
+
+- **I/O overhead and latency (I/O 오버헤드·지연)**
+  - 가장 큰 단점 — record 마다 한 요청이라 I/O 오버헤드와 지연이 커짐.
+    전달할 데이터가 많고 분당 전달 건수를 보는 모니터링 대시보드가 있으면 특히 두드러짐.
+  - **멀티스레딩** 으로 완화 가능(여러 프로세스에서 개별 요청). 단 프로세스 간 순서 보장이 문제 —
+    서로 격리돼 있기 때문. 좋은 전략은 **정렬 대상의 scope 를 엔티티별로 만드는 것** —
+    한 user/product 의 모든 record 를 같은 프로세스에 할당.
+    (bin 과 비슷하나, 각 컨테이너가 같은 엔티티의 모든 record 를 담아 비동기로 개별 전달함.)
+- **FIFO is not exactly once (FIFO 는 정확히 한 번이 아님)**
+  - FIFO 는 **가장 오래된 것부터 전달** 한다는 뜻일 뿐, exactly-once 를 보장하지 않음.
+    예: `producer.send(message)` → `consumer.ack(message)` 에서 send 성공 후 **ack 가 실패** 할 수 있음 →
+    재시작 시 producer 가 **이미 전달된 record 를 재전송** 함.
+  - 완화 — 챕터 4의 멱등성 패턴에 기댐.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — 개별 전달 (Example 5-33, Kafka)**
+
+record 하나 produce 후 즉시 flush — 쉽지만 record 당 한 요청이라 네트워크 비쌈:
+```python
+producer.produce(...)
+producer.flush()
+```
+
+**예시 2 — bulk + concurrency=1 (Example 5-34)**
+
+`flush` 없이 producer 가 최대 1건씩만 동시 처리하게 해 동시 쓰기로 인한 순서 붕괴를 막음:
+```python
+producer = Producer({
+   'max.in.flight.requests.per.connection': 1,   # 동시 1건만
+   'queue.buffering.max.ms': 1000
+})
+producer.produce(...)
+```
+
+**예시 3 — idempotent producer (Example 5-35)**
+
+idempotent producer(KIP-98)는 **최대 5 concurrent 를 허용하면서도 순서 보장** — 버퍼링 시간을 늘려 bulk 를 더 채움:
+```python
+producer = Producer({
+  'max.in.flight.requests.per.connection': 5,
+  'enable.idempotence': True,                    # 순서 보장하며 동시성↑
+  'queue.buffering.max.ms': 2000
+})
+producer.produce(...)
+```
+
+**예시 4 — Kinesis SequenceNumberForOrdering (Example 5-36)**
+
+bulk 불가(partial commit) 저장소면 개별 요청. 직전 sequence number 를 넘겨 순서를 강제:
+```python
+records_to_deliver = [...]
+previous_sequence_number = None
+for record in records_to_deliver:
+  put_result = client.put_record(StreamName=..., Data=...,
+    SequenceNumberForOrdering=previous_sequence_number)   # 없으면 rough order
+  previous_sequence_number = put_result.sequence_number
+```
+
+**예시 5 — GCP Pub/Sub ordering_key (Example 5-37)**
+
+`ordering_key` 는 grouping key 처럼 작동 — 같은 key 를 공유하는 record 를 FIFO 로 전달(같은 publisher·single region 내에서만):
+```python
+records_to_deliver = [Record(data=..., ordering_key="a"),
+  Record(data=..., ordering_key="b"), Record(data=..., ordering_key="c"),
+  Record(data=..., ordering_key="a")]
+for record in records_to_deliver:
+  publisher.publish(..., data=..., ordering_key=record.ordering_key)
+```
+
+> **트러블 로그** — FIFO 를 멀티스레딩으로 가속하면서 엔티티 scope 를 안 나누면 순서가 깨짐.
+> 예: `user_id` 무관하게 4개 스레드로 개별 전송하면, 같은 user 의 `click → purchase` 가 서로 다른 스레드에서 경합해
+> `purchase` 가 먼저 도착 → 전환 분석이 역전됨.
+> 같은 엔티티(user)의 record 는 **같은 스레드/프로세스에 고정** 할 것.
+> 또 ack 실패로 재전송될 수 있으니, exactly-once 가 필요하면 챕터 4의 멱등성 패턴으로 보완할 것.
+
+---
+
+## 6. 요약 (Summary)
+
+챕터 5는 데이터셋의 **가치를 높이는** 방법을 다뤘음. 크게 두 시나리오로 나뉨.
+
+- **정보를 더해서** 가치를 높이는 경우
+- **정보를 줄여서** 더 이해하기 쉽게 만드는 경우
+
+```
+[챕터 5 한눈에 — 데이터 가치 패턴 5갈래]
+──────────────────────────────────────────────────────────────────────
+ 정보 추가 ┌ 5.1 Data Enrichment   다른 데이터셋과 결합   #23 Static / #24 Dynamic Joiner
+          └ 5.2 Data Decoration   raw record 에 주석     #25 Wrapper / #26 Metadata Decorator
+
+ 정보 축약 ┌ 5.3 Data Aggregation  대량을 요약           #27 Distributed / #28 Local Aggregator
+          └ 5.4 Sessionization    이벤트를 세션으로 묶음  #29 Incremental / #30 Stateful Sessionizer
+
+ 순서 보장   5.5 Data Ordering    시간순 전달           #31 Bin Pack / #32 FIFO Orderer
+──────────────────────────────────────────────────────────────────────
+```
+
+- **정보 추가 시나리오**
+  - **Data Enrichment** — 데이터셋 결합. 동질 파이프라인뿐 아니라 **스트리밍 + 배치** 이질 환경에서도 가능.
+  - **Data Decoration** — raw record 에 주석. **Wrapper** 는 원본과 계산값을 분리(데이터 표현의 일관성 확보),
+    **Metadata Decorator** 는 그 계산값을 **메타데이터 레이어에 숨겨** 최종 사용자에게 노출하지 않음.
+- **정보 축약 시나리오**
+  - **Data Aggregation** — 분산(Distributed) 또는 로컬(Local) 환경에서 요약.
+  - **Sessionization** — 증분 배치(Incremental) 또는 실시간 스트리밍(Stateful)으로 사용자 경험을 세션으로 요약.
+- **순서 보장**
+  - **Data Ordering** — **Bin Pack Orderer** 는 partial commit 맥락에서 순서를 지키고,
+    **FIFO Orderer** 는 네트워크 교환을 희생해 단순함을 택하는 대안.
+
+> 다음 여정 — 지금까지 **수집(2장) · 오류 관리(3장) · 멱등성(4장) · 데이터 가치(5장)** 패턴을 익혔음.
+> 아직 한 가지가 남음 — **이 모든 걸 어떻게 연결하나?** 그게 챕터 6(데이터 흐름)의 주제.
