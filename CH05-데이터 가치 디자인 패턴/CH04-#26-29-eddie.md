@@ -513,17 +513,54 @@ DISTSTYLE ALL;
 
 
 
-## 5.4 세션화(Sessionization)
-
-- 패턴#29 증분 세션화기(Incremental Sessionizer)
-- 패턴#30 상태 저장 세션화기(Stateful Sessionizer)
-
+## 5.4 세션화(Sessionization
+<앞장과 비교>
 5.3(데이터 집계)
 - grouping key별로 여러 레코드를 하나의 스칼라 값(평균, 카운트 등)으로 줄이는 작업
 5.4(세션화)
 - grouping key(여기서는 `visit_id`)별로 레코드를 묶는다는 점은 같지만, 
 - 결과물이 스칼라가 아니라 "시작 시점 ~ 종료 시점 + 그 사이의 이벤트 목록"으로 구성된 세션
 - "언제 세션이 끝났다고 판단할 것인가"라는 경계(boundary) 정의 문제 발생
+
+<다룰패턴>
+- 패턴#29 증분 세션화기(Incremental Sessionizer)
+- 패턴#30 상태 저장 세션화기(Stateful Sessionizer)
+- 구조적 개념(pending 세션 유지)은 동일
+	- 차이는 **실행 단위** : 배치는 파티션 단위, 스트리밍은 이벤트 단위
+	- 차이는 **관리 주체** : 배치는 엔지니어가 SQL로 직접, 스트리밍은 프레임워크가 자동
+
+**비교**
+|항목|Incremental Sessionizer (배치)|Stateful Sessionizer (스트리밍)|
+|---|---|---|
+|state 저장소|DB 테이블 (pending sessions table)|프레임워크 내장 state store (메모리 + 체크포인트)|
+|state 관리 주체|**엔지니어가 직접** SQL로 읽고/쓰고/삭제|**Spark/Flink 프레임워크가** 자동 관리|
+|트리거|Airflow DAG이 스케줄에 따라 실행|이벤트 도착 즉시 실행|
+|state 조회 타이밍|배치 실행 시 pending table 전체 JOIN|이벤트 수신 시마다 해당 키만 즉시 조회|
+|만료 처리|엔지니어가 직접 inactivity period 계산 후 DELETE|프레임워크가 워터마크 기반으로 자동 만료|
+
+**프로세스 차이 핵심**
+
+배치:
+
+```
+Airflow 스케줄 트리거
+→ pending table 전체 읽기 (SQL JOIN)
+→ 새 파티션 이벤트와 병합
+→ 완료 세션 → completed table
+→ 미완료 세션 → pending table에 다시 씀
+```
+
+스트리밍:
+
+```
+이벤트 1개 도착
+→ state store에서 해당 visit_id만 즉시 조회
+→ 누적 후 업데이트
+→ 타임아웃 시 자동 만료 + emit
+```
+
+
+
 
 
 
@@ -639,3 +676,383 @@ INSERT INTO dedp.pending_sessions
 - Lakehouse 배치-스트림 통합 - 시간 단위 배치 세션화 대신 패턴#30(상태 저장 세션화기)처럼 스트리밍+state store로 전환하는 추세
 
 
+
+## 패턴#30 상태저장 세션화기(Stateful Sessionizer)
+
+### (1) 문제상황
+
+**배경 : Incremental Sessionizer(#28)의 한계**
+
+- 배치 기반 → 파티션이 생성돼야 처리 시작
+- 레이턴시 최소 1시간 (파티션 간격에 종속)
+- Kafka에는 이미 이벤트가 초 단위로 들어오고 있음
+
+**그렇다면 일반 스트리밍으로 대체하면 되는가? → 안 됨**
+stateless 스트리밍 : 이벤트 수신 즉시 처리 후 버림. 이전 이벤트를 기억하지 않음.
+세션화의 본질 = "여러 이벤트를 묶어 하나의 세션으로 판단" → 이전 이벤트 기억이 전제조건
+
+**실제 문제 상황**
+
+블로그 플랫폼, 세션 규칙 : 마지막 이벤트로부터 30분 비활성 → 세션 종료
+- 마지막 이벤트 발생 시각 기준으로 타이머 시작
+- 30분 동안 같은 `visit_id`로 새 이벤트가 안 들어오면 → 세션 종료 처리
+- 새 이벤트가 들어오면 → 타이머 리셋, 세션 계속 유지
+
+```
+[10:01] user_A  visit_id=V001  page=/home
+[10:08] user_A  visit_id=V001  page=/product/123
+[10:44] user_A  visit_id=V001  page=/cart        ← 이전 이벤트로부터 36분
+```
+
+- stateless 스트리밍 잡이 `[10:44]` 수신 시 → "36분 경과" 판단 불가
+- `[10:08]`을 이미 버렸기 때문
+- 세션 종료 판단 자체가 구조적으로 불가능
+
+**문제 핵심 정리**
+
+|방식|한계|
+|---|---|
+|Incremental Sessionizer(배치)|레이턴시 최소 1시간|
+|stateless 스트리밍|이전 이벤트 기억 불가 → 세션 경계 판단 불가|
+|필요한 것|이전 이벤트 기억 + 스트리밍 속도|
+
+
+
+
+### (2) 솔루션
+
+**주요 컨셉 : state store로 진행 중인 세션을 메모리에 유지하면서 스트리밍으로 처리한다**
+
+**state store란**
+- Incremental Sessionizer의 pending sessions storage를 스트리밍 버전으로 구현한 것
+- 2계층 구조로 동작
+
+|계층|역할|특징|
+|---|---|---|
+|메모리 계층|빠른 읽기/쓰기|휘발성 → 장애 시 유실 위험|
+|체크포인트(내구성 스토리지)|장애 복구용|주기적으로 메모리 상태를 동기화|
+
+**처리 흐름 (이벤트 수신 시마다 반복)**
+1. 이벤트 수신 → `visit_id` 기준으로 그루핑
+2. state store에서 해당 `visit_id` 세션 조회
+    - 없으면 → 신규 세션 생성 (Initialization)
+    - 있으면 → 기존 세션 재개 (Resume)
+3. 새 이벤트를 세션에 누적 (Accumulation) → 방문 페이지 이력 추가
+4. 세션 완료 여부 판단
+    - inactivity period 초과 → 세션 종료 (Finalization) → output으로 emit + state 삭제
+    - 미완료 → state store에 업데이트된 세션 상태 저장
+
+**세션 만료 기준 : 이벤트 타임 vs 처리 타임**
+- 처리 타임(processing time) 기준 : 현재 시각 기준으로 만료 판단
+    - 문제 : 재시도/지연 발생 시 세션이 조기 종료될 수 있음
+- 이벤트 타임(event time) + 워터마크 기준 : 이벤트에 찍힌 시각 기준으로 판단
+    - 권장 : 잡의 진행 상황에 연동되어 예측 가능
+
+**구현 방식 2가지**
+
+|방식|특징|선택 기준|
+|---|---|---|
+|Session Window|프레임워크가 gap duration 기반으로 자동 관리|단순한 비활성 기간 기반 세션|
+|Arbitrary Stateful Processing|직접 상태 함수 구현, 세션 키마다 다른 로직 가능|복잡한 비즈니스 로직 필요 시|
+
+- 실무 선호 : Arbitrary Stateful Processing
+- 이유 : 세션 키마다 다른 만료 규칙, 부분 세션 emit 등 유연한 제어 필요한 경우가 대부분
+
+
+
+  
+
+### (3) 결과
+
+**긍정적 효과**
+- 세션이 닫히는 즉시 output emit → 준실시간 세션 제공
+- 프레임워크(Spark Structured Streaming / Flink)가 state store 관리 자동화
+- Incremental Sessionizer 대비 레이턴시 대폭 감소 (1시간 → 초~분 단위)
+- 장애 발생 시 체크포인트에서 재시작 → 세션 유실 없음
+
+**트레이드오프 / 주의사항**
+
+|항목|내용|
+|---|---|
+|At-least-once 처리|체크포인트 주기적 저장 → 재시작 시 일부 이벤트 중복 처리 가능|
+|세션 키 멱등성|재시작마다 바뀌는 값(현재 시각 등)을 세션 ID 생성에 쓰면 안 됨|
+|스케일링 비용|워커 추가/제거 시 state rebalancing 발생 → 일시적 처리 중단|
+|inactivity period 길이|길수록 메모리/비용 증가, 짧으면 세션 조기 종료 위험|
+|만료 기준|처리 타임 기반은 지연/재시도로 오동작 가능 → 이벤트 타임 기반 권장|
+
+
+### (4) 예시
+
+> "블로그 플랫폼 사기 탐지팀에서 요청이 왔다. 세션이 닫히자마자 결과 줘야 한다고. 배치로는 답 없고, 그렇다고 단순 스트리밍으론 세션을 만들 수가 없잖아. `applyInPandasWithState` 써야 할 때가 왔구나. state store에 진행 중인 세션 쌓아두면서, 10분 무소식이면 세션 닫아서 output으로 내보내는 거야."
+
+**등장인물**
+
+- Kafka : 이벤트 소스
+- Spark Structured Streaming 잡 : 세션 처리
+- state store : 진행 중인 세션 임시 보관소 (메모리)
+
+---
+
+**Step 1. 이벤트 3개가 순서대로 들어온다**
+
+```
+[10:01] visit_id=V001, user_A, page=/home
+[10:08] visit_id=V001, user_A, page=/product
+[10:44] visit_id=V001, user_A, page=/cart
+```
+  
+
+**Step 2. 첫 번째 이벤트 수신 [10:01]**
+
+Spark 잡이 `[10:01]` 이벤트를 받는다.
+
+state store에 `V001` 세션이 있는지 확인한다 → 없음
+
+신규 세션 생성 후 state store에 저장한다.
+
+```
+state store 상태:
+V001 → { pages: [/home], last_event_time: 10:01 }
+```
+
+output으로 내보내는 것 : 없음 (세션 아직 진행 중)
+
+
+  
+
+**Step 3. 두 번째 이벤트 수신 [10:08]**
+
+Spark 잡이 `[10:08]` 이벤트를 받는다.
+
+state store에 `V001` 세션이 있는지 확인한다 → 있음
+
+기존 세션에 새 페이지 누적 후 state store 업데이트한다.
+
+```
+state store 상태:
+V001 → { pages: [/home, /product], last_event_time: 10:08 }
+```
+
+타이머 갱신 : 10:08 + 10분 = **10:18에 만료**
+
+output으로 내보내는 것 : 없음 (세션 아직 진행 중)
+
+
+  
+
+**Step 4. 세 번째 이벤트 수신 [10:44]**
+
+Spark 잡이 `[10:44]` 이벤트를 받는다.
+
+이벤트 타임이 10:44 → 워터마크가 앞으로 이동한다.
+
+Spark이 판단한다 : "V001의 타이머가 10:18이었는데, 지금 워터마크가 10:18을 넘었다 → **타임아웃**"
+
+`hasTimedOut = True` 발동
+
+```
+state store 상태:
+V001 → { pages: [/home, /product], last_event_time: 10:08 }
+         ↓
+         세션 완료 처리
+         ↓
+state store에서 V001 삭제
+```
+
+output으로 내보내는 것 : 완료된 세션
+
+```
+{
+  visit_id: V001,
+  user_id: user_A,
+  start_time: 10:01,
+  end_time: 10:08,
+  visited_pages: [/home, /product],
+  duration: 7분
+}
+```
+
+그 다음 `[10:44]` 이벤트는 새 세션으로 처리된다.
+
+```
+state store 상태:
+V001 → { pages: [/cart], last_event_time: 10:44 }
+```
+
+타이머 갱신 : 10:44 + 10분 = **10:54에 만료**
+
+**코드 전체 구조 = Step 2~4 그대로**
+
+```
+def map_visits_to_session(visit_id_tuple, input_rows, current_state):
+
+    # ─── Step 4 : 타임아웃 발동 ───────────────────────────
+    if current_state.hasTimedOut:
+        visits, user_id = current_state.get     # state store에서 누적 이력 꺼냄
+        visit_to_return = get_session_to_return(visits, user_id)
+        current_state.remove()                  # state store에서 V001 삭제
+        yield pandas.DataFrame(visit_to_return) # 완료된 세션 output emit
+
+    else:
+        visits_so_far = []
+
+        # ─── Step 2 : 신규 세션 / Step 3 : 기존 세션 재개 ──
+        if current_state.exists:
+            visits_so_far, user_id = current_state.get  # 기존 세션 resume
+
+        # 새 이벤트 누적
+        visits_for_state = visits_so_far + new_visits
+        current_state.update((visits_for_state, user_id))  # state store 업데이트
+
+        # ─── 타이머 갱신 ─────────────────────────────────
+        timeout_timestamp = base_watermark + session_expiration_time
+        current_state.setTimeoutTimestamp(timeout_timestamp)  # 만료 시각 설정
+```
+
+**흐름 → 코드 매핑**
+
+|흐름|코드|
+|---|---|
+|state store에 세션 있는지 확인|`current_state.exists`|
+|신규 세션 생성 / 기존 세션 재개|`current_state.get`|
+|이벤트 누적 + 저장|`current_state.update()`|
+|타이머 갱신|`setTimeoutTimestamp()`|
+|10분 초과 → 타임아웃|`current_state.hasTimedOut`|
+|세션 완료 → output emit|`yield DataFrame`|
+|state store 삭제|`current_state.remove()`|
+
+---
+
+
+
+
+**코드 1 : 스트리밍 그루핑 + applyInPandasWithState 선언**
+
+이 코드가 하는 일 : Kafka에서 읽어온 이벤트를 `visit_id`로 그루핑하고, 각 그룹에 상태 처리 함수를 적용하는 선언부
+
+```
+# ★ 핵심: applyInPandasWithState — state store 기반 임의 상태 처리 적용
+grouped_visits = (
+    visits_from_kafka
+    .withWatermark('event_time', '1 minute')   # 워터마크 기준: 이벤트 타임
+    .groupBy(F.col('visit_id'))                # 세션 키: visit_id
+)
+
+sessions = grouped_visits.applyInPandasWithState(
+    func=map_visits_to_session,                # 실제 세션 로직 함수
+    outputStructType=StructType([              # output 스키마: 완료된 세션
+        StructField("visit_id", StringType()),
+        StructField("user_id", StringType()),
+        StructField("start_time", TimestampType()),
+        StructField("end_time", TimestampType()),
+        StructField("visited_pages", visited_pages_type),
+        StructField("duration_in_milliseconds", LongType())
+    ]),
+    stateStructType=StructType([              # state store 스키마: 진행 중인 세션
+        StructField("visits", visited_pages_type),
+        StructField("user_id", StringType())
+    ]),
+    outputMode="update",                      # 변경된 행만 output으로 내보냄
+    timeoutConf="EventTimeTimeout"            # 만료 기준: 이벤트 타임
+)
+```
+
+**파라미터 역할 정리**
+
+|파라미터|역할|
+|---|---|
+|`func`|실제 세션 생성/누적/종료 로직 함수|
+|`outputStructType`|완료된 세션의 output 스키마|
+|`stateStructType`|state store에 저장할 진행 중 세션 스키마|
+|`outputMode="update"`|상태 변경이 있는 세션만 emit|
+|`timeoutConf="EventTimeTimeout"`|이벤트 타임 기준으로 비활성 판단|
+
+---
+
+**코드 2 : 세션 상태 처리 함수 (핵심 로직)**
+
+이 코드가 하는 일 : 이벤트 수신 시마다 호출되어 세션을 생성/누적/종료 처리
+
+```
+def map_visits_to_session(
+    visit_id_tuple: Any,
+    input_rows: Iterable[pandas.DataFrame],
+    current_state: GroupState           # state store 접근 인터페이스
+) -> Iterable[pandas.DataFrame]:
+
+    session_expiration_time = 10 * 60 * 1000  # 10분 (ms 단위)
+    visit_id = visit_id_tuple[0]
+    visit_to_return = None
+
+    # ★ 핵심: hasTimedOut — 10분 비활성 초과 시 세션 종료
+    if current_state.hasTimedOut:
+        visits, user_id = current_state.get
+        visit_to_return = get_session_to_return(visits, user_id)
+        current_state.remove()          # state store에서 세션 삭제
+    else:
+        # 누적 로직 (Accumulation)
+        visits_so_far = []
+        if current_state.exists:
+            visits_so_far, user_id = current_state.get   # 기존 세션 재개
+
+        # 새 이벤트를 기존 이벤트에 누적
+        visits_for_state = visits_so_far + new_visits
+        current_state.update((visits_for_state, user_id))  # state store 업데이트
+
+        # 만료 타이머 갱신 (워터마크 + 10분)
+        timeout_timestamp = base_watermark + session_expiration_time
+        current_state.setTimeoutTimestamp(timeout_timestamp)
+
+    if visit_to_return:
+        yield pandas.DataFrame(visit_to_return)  # 완료된 세션 output emit
+```
+
+**핵심 흐름 정리**
+
+```
+이벤트 수신
+    │
+    ├─ current_state.hasTimedOut == True
+    │       → current_state.get   (누적된 방문 이력 꺼냄)
+    │       → get_session_to_return()  (세션 완성)
+    │       → current_state.remove()  (state 삭제)
+    │       → yield DataFrame  (output emit)  ← 세션 종료
+    │
+    └─ hasTimedOut == False
+            → current_state.exists?
+            │   True  → 기존 세션 resume
+            │   False → 신규 세션 create
+            → current_state.update()   (누적 이력 저장)
+            → setTimeoutTimestamp()    (타이머 갱신)  ← 세션 유지
+```
+
+---
+
+> "신입 때 `outputMode="update"` 랑 `"append"` 헷갈려서 세션이 완료되기 전에 중간 상태가 계속 output으로 나온 적 있어. update는 상태가 변경된 세션만 emit하는 거고, append는 완료된 세션만 emit하는 거야. 세션화에서는 update 써야 중간 누적 상태도 다운스트림에 줄 수 있어. 그리고 `setTimeoutTimestamp`에 processing time 쓰면 재시도 구간에서 세션이 조기 종료되는 버그 만나게 돼. 무조건 워터마크 기반으로 써."
+
+
+### (5) 최신트렌드
+
+**현재 실무에서 Stateful Sessionizer를 어떤 툴로 구현하는가**
+
+|툴|특징|선택 기준|
+|---|---|---|
+|Apache Flink|상태 관리 정밀도 최고, exactly-once 지원, 낮은 레이턴시|세션 로직 복잡, 대규모 트래픽|
+|Spark Structured Streaming|Databricks 환경에 자연스럽게 통합, `applyInPandasWithState`|이미 Spark 스택 사용 중|
+|Kafka Streams|Kafka 클러스터 내부에서 처리, 별도 클러스터 불필요|단순한 세션 로직, 경량 파이프라인|
+
+**실무 선호 : Apache Flink**
+- 이유 1 : state store 관리가 Spark보다 정밀함 → RocksDB 기반 state backend로 대용량 상태도 안정적 처리
+- 이유 2 : exactly-once 보장이 Spark보다 강력 (Spark는 at-least-once가 기본)
+- 이유 3 : 세션 윈도우 API가 Spark보다 직관적이고 유연함
+- 단점 : 러닝커브 높음, Spark 스택 팀에서는 도입 비용이 큼
+
+**Databricks 환경이면 Spark Structured Streaming 유지**
+- Databricks가 `applyInPandasWithState` 성능을 계속 개선 중
+- Delta Live Tables(DLT)와 조합하면 파이프라인 관리 자동화 가능
+- 팀이 PySpark에 익숙하면 Flink 전환 비용이 더 큼
+
+**state backend 트렌드**
+- Flink : RocksDB (디스크 기반) → 메모리 초과해도 state 유지 가능
+- Spark : 기본 메모리 기반 → 대규모 세션 수 많으면 OOM 위험
+- 최근 : Flink + Apache Paimon 조합으로 state를 lakehouse에 직접 저장하는 패턴 증가
