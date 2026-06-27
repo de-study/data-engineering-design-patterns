@@ -2,11 +2,17 @@
 
 **CH05에서 CH06으로 넘어오는 맥락**
 
-- CH05 : 데이터 자체의 가치를 만드는 패턴 (집계, 세션화, 정렬 등)
-- CH06 : 그 데이터를 만드는 단계들을 어떻게 연결하고 조율할 것인가
+- CH05는 **데이터 변환** 
+	- 원시 이벤트를 받아서 → 집계, 세션, 정렬된 결과물을 만드는 것
+	- "무엇을 만드는가"
+
+- CH06은 **파이프라인 실행 제어**
+	- 태스크 A가 끝나야 태스크 B를 실행
+	- 팀A 파이프라인이 끝나야 팀B 파이프라인 시작
+	- 여러 태스크를 동시에 실행할지, 순서대로 실행할지
+	- "어떤 순서로, 언제, 누가 실행하는가"
 
 **CH06의 핵심 질문**
-
 - 여러 태스크를 어떤 순서로 실행할 것인가
 - 여러 파이프라인이 서로 어떻게 의존할 것인가
 - 병렬/순차 실행을 어떻게 제어할 것인가
@@ -23,6 +29,7 @@
 ||Exclusive Choice|조건에 따라 하나의 브랜치만 실행|
 |오케스트레이션|Single Runner|파이프라인 동시 실행 1개로 제한|
 ||Concurrent Runner|파이프라인 동시 실행 허용|
+
 
 
 
@@ -105,17 +112,44 @@ input_data_sensor >> load_data_to_table >> expose_new_table
 **PySpark 데이터 처리 레이어**
 
 ```
-# ★ 핵심: 각 단계 결과를 변수로 연결 — 명시적 의존성 표현
+# 1단계: 원시 데이터 읽기
 input_dataset = spark_session.read...
+# input_dataset = S3에서 읽어온 원시 방문 이벤트 DataFrame
 
+# ★ 핵심: 2단계 결과를 변수에 담아 3단계의 입력으로 연결
 valid_and_enriched = (
     input_dataset
-    .filter(...)      # 유효성 검사
-    .join(...)        # 데이터 보강
+    .filter(...)   # 2단계: 유효성 검사 — 잘못된 이벤트 제거
+    .join(...)     # 3단계: 데이터 보강 — 유저 정보 등 추가
 )
+# valid_and_enriched가 없으면 write 단계 실행 불가 → 암묵적 순서 보장
 
-valid_and_enriched.write...  # 저장
+# 4단계: 정제된 데이터 저장
+valid_and_enriched.write...
 ```
+- Airflow : 태스크 단위로 실행 순서 선언, 실패 시 해당 태스크부터 재시작 가능
+- PySpark : 코드 흐름이 순서 결정, 중간 실패 시 잡 전체 재실행 필요
+
+AWS EMR 오케스트레이션 레이어
+- EMR은 Airflow `>>`처럼 자동으로 상위 태스크 성공 여부를 체크하지 않음.  
+- `ActionOnFailure` 설정으로 실패 시 동작을 **직접 명시**해야 함.
+~~~
+# 1단계: 데이터 적재 스텝 추가
+aws emr add-steps \
+  --cluster-id j-CLUSTER_ID \
+  --steps Type=Spark,\
+          Name="DataLoader",\
+          ActionOnFailure=TERMINATE_CLUSTER,\  # ★ 핵심: 실패 시 클러스터 종료
+          Args=[--class com.waitingforcode.DataLoader]
+
+# 2단계: 데이터 노출 스텝 추가
+aws emr add-steps \
+  --cluster-id j-CLUSTER_ID \
+  --steps Type=Spark,\
+          Name="DataPublisher",\
+          ActionOnFailure=TERMINATE_CLUSTER,\  # ★ 핵심: 실패 시 클러스터 종료
+          Args=[--class com.waitingforcode.DataPublisher]
+~~~
 
 > "신입 때 주의할 점. Airflow에서 `>>`로 연결하면 기본적으로 상위 태스크 성공 시에만 다음 태스크 실행돼. 근데 AWS EMR 스텝 방식은 `ActionOnFailure` 직접 설정 안 하면 실패해도 다음 스텝 실행될 수 있어. EMR 쓸 때 `TERMINATE_CLUSTER` 꼭 확인해."
 
