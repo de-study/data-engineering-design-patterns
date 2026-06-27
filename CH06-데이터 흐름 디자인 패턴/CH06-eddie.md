@@ -169,3 +169,65 @@ aws emr add-steps \
 - Airflow가 여전히 표준이지만 Dagster/Prefect로 전환하는 팀 증가
 - 이유 : 코드 기반 의존성 정의 → 테스트 작성 용이, 로컬 개발 편리
 - Databricks 환경이면 Workflows가 Airflow 대비 Spark 잡 관리 통합도가 높음
+
+
+### (6)추가 - Orchestration 비교
+
+**Airflow vs Dagster/Prefect 차이**
+
+Airflow는 DAG 정의와 비즈니스 로직이 분리되어 있음.
+
+```
+# Airflow: DAG 파일 따로, 실제 로직 따로
+@dag
+def my_pipeline():
+    task_a = PythonOperator(task_id='a', python_callable=run_a)
+    task_b = PythonOperator(task_id='b', python_callable=run_b)
+    task_a >> task_b
+
+# 테스트하려면 Airflow 환경 전체가 필요
+# 로컬에서 단위 테스트 작성 어려움
+```
+
+Dagster는 데이터 에셋 자체가 의존성을 선언함.
+
+```
+# Dagster: 함수 자체가 파이프라인
+@asset
+def cleaned_visits(raw_visits):      # raw_visits가 있어야 실행 → 자동 의존성
+    return raw_visits.filter(...)
+
+@asset
+def session_table(cleaned_visits):   # cleaned_visits가 있어야 실행 → 자동 의존성
+    return cleaned_visits.groupBy(...)
+
+# 테스트: 그냥 Python 함수 테스트와 동일
+def test_cleaned_visits():
+    result = cleaned_visits(mock_raw_visits)
+    assert result.count() > 0
+```
+
+**실무에서 편한 포인트**
+
+|항목|Airflow|Dagster/Prefect|
+|---|---|---|
+|로컬 테스트|Airflow 서버 띄워야 함|그냥 pytest로 실행|
+|의존성 선언|`>>` 연산자로 수동 연결|함수 인자가 곧 의존성|
+|에셋 계보|별도 lineage 툴 필요|UI에서 자동으로 시각화|
+|디버깅|로그 보려면 UI 접속|로컬 터미널에서 바로 확인|
+
+**Databricks Workflows가 편한 포인트**
+
+- Spark 잡을 Workflows에 등록하면 클러스터 생성/종료 자동 관리
+- Airflow에서 Spark 잡 실행하려면 `SparkSubmitOperator` + 클러스터 설정 직접 관리
+- 태스크 단위 재실행 시 동일 클러스터 재사용 가능 → 클러스터 시작 대기 시간 없음
+- Delta Lake, MLflow, Unity Catalog와 네이티브 통합 → 별도 연결 설정 불필요
+
+**선택 기준 요약**
+
+|상황|선택|
+|---|---|
+|이미 Airflow 운영 중, 팀 규모 큼|Airflow 유지|
+|새 프로젝트, Python 친화적 팀|Dagster|
+|Databricks 올인 환경|Databricks Workflows|
+|경량 파이프라인, 빠른 프로토타이핑|Prefect|
