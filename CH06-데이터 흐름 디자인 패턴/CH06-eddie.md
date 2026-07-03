@@ -231,3 +231,176 @@ def test_cleaned_visits():
 |새 프로젝트, Python 친화적 팀|Dagster|
 |Databricks 올인 환경|Databricks Workflows|
 |경량 파이프라인, 빠른 프로토타이핑|Prefect|
+
+
+
+
+
+
+
+
+<br><br><br><br><br>
+
+
+
+
+## 패턴#33 독립 시퀀서(Isolated Sequencer)
+
+### (1)문제상황
+
+- 결론: **소유권이 다른 두 파이프라인에 순서 의존성은 있는데, 하나로 합칠 수 없는 상황.**
+- 등장 컴포넌트:
+    - `devices_loader` : 우리 팀 소유 Airflow DAG. 원천 데이터를 정제·적재한다.
+    - `devices_aggregator` : 시각화 팀 소유 Airflow DAG. 우리 정제 데이터를 받아 대시보드용으로 변환한다.
+- 엔지니어 독백(실무 시나리오):
+    
+    > 시각화 팀과 회의에서 대시보드 변환은 우리 책임 아니라고 선을 그었다. 우리는 정제 데이터만 준다. 근데 걔네 DAG는 우리가 데이터를 다 만든 뒤에만 돌아야 한다. 순서는 엮여 있는데 팀이 다르니 한 DAG로는 못 묶는다. 스케줄만 시간차로 벌려두면 우리가 지연되는 순간 걔네가 빈 데이터로 돌아버린다.  
+    
+- 문제의 본질:
+    - 로컬 시퀀서처럼 `A >> B`로 못 묶는다. 물리적으로 분리된 별개 DAG다.
+    - 스케줄 시간차만으로 처리하면 비동기화(desynchronization) 발생.
+
+
+### (2)솔루션
+
+- 주요컨셉: **다른 DAG가 만든 "끝났다" 신호를 경계 너머로 전달해, 소비자 DAG를 깨운다.**
+- 신호가 필요한 이유:
+    - 같은 DAG 안 : `A >> B` 화살표로 순서 자동 연결.
+    - 다른 DAG : 소비자 태스크가 남의 DAG에 있어 화살표가 안 닿는다.
+    - 따라서 경계를 넘는 별도 신호 장치가 필요하다.
+
+- 신호 전달 방식 두 가지:
+	- 데이터 기반(data-based)
+	    - 동작: 소비자 DAG가 "제공자가 남긴 결과물(파일/파티션)"이 생겼는지 스스로 감시하다 시작.
+	    - 신호의 정체: 데이터 그 자체. 데이터가 있으면 "끝났다"로 해석.
+	    - 배경: 예전엔 두 DAG를 억지로 하나로 합치거나 스케줄 시간차로 벌려뒀다. 시간차 방식은 제공자가 지연되면 소비자가 빈 데이터로 도는 한계가 있었다. 데이터 존재를 직접 확인하는 방식이 이 한계를 없앴다.
+	    - 결합도: 낮음. 소비자는 제공자 DAG 내부를 모른다. 파일 경로만 안다.
+	- 태스크 기반(task-based)
+	    - 동작: 제공자 DAG가 자기 태스크 끝에서 소비자 DAG를 직접 트리거.
+	    - 신호의 정체: 트리거 호출. 제공자가 소비자 DAG ID를 지목해 실행 신호를 던짐.
+	    - 배경: 넘길 공유 데이터가 없는 경우(예: 소비자가 데이터 처리가 아니라 알림 전송만 수행) 데이터 기반은 감시할 대상이 없어 못 쓴다. 이 공백을 트리거 호출로 메운다.
+	    - 결합도: 높음. 제공자 코드에 소비자 DAG ID가 박힌다.
+- 실무 선호:
+    - 기본은 **데이터 기반**.
+    - 이유: 두 팀 결합도를 낮춰야 한쪽 배포·변경이 다른 쪽을 안 깨뜨린다.
+    - 예외: 공유 데이터셋이 없고 "행동(알림·트리거)"만 넘겨야 할 때 → **태스크 기반**. 감시할 데이터가 없어 데이터 기반이 불가능하기 때문.
+
+
+
+### (3)결과
+- 스케줄링 : 태스크 기반은 두 DAG가 같은 스케줄을 공유해야 깔끔 (다르면 스킵 분기로 복잡도 증가)
+- 커뮤니케이션 : 팀이 다르므로 breaking change 사전 공유 문화 없으면 상대가 깨짐 (기술로 완전 해결 불가)
+	- 팀이 다르면 스키마·계약 변경을 말로 미리 공유하지 않는 한, 자동으로는 상대 파이프라인 파손을 못 막는다는 뜻.
+
+
+
+### (4)예시
+
+- 엔지니어 독백:
+> 나는 "팀 경계 = DAG 경계"로 본다. 우리가 제공자면 소비자 팀에 DAG를 안 열어준다. 
+> 대신 "이 경로에 파일 떨어지면 너희가 센서로 잡아라"라고 계약만 건다. 
+> 태스크 기반은 편해 보여도 상대 DAG ID를 내 코드에 박는 순간 배포 스케줄까지 엮인다. 
+> 그래서 파일 센서 기반을 기본값으로 깐다.
+
+- 도메인: 디바이스 텔레메트리 파이프라인
+    - `devices_loader` : producer Airflow DAG. 정제 파일을 날짜 파티션 경로에 기록.
+    - `devices_aggregator` : consumer Airflow DAG. 그 파일을 감지해 집계.
+- 책 예시는 두 가지 구현을 모두 제시한다.
+
+---
+
+- 예시 1) 데이터 기반 의존성 (Example 6-4) — FileSensor로 파일 존재 감지
+	- producer가 파일을 떨구면, consumer가 그 파일을 보고 스스로 시작한다.
+
+```
+# devices_loader (producer)
+@task
+def load_new_devices_to_internal_storage():
+    ctx = get_current_context()
+    partitioned_dir = f'{devices_file_location}/{ctx["ds_nodash"]}'
+    internal_file_location = f'{partitioned_dir}/dataset.csv'
+    shutil.copyfile(input_devices_file, internal_file_location)
+
+input_data_sensor >> load_new_devices_to_internal_storage()
+
+# devices_aggregator (consumer)
+input_data_sensor = FileSensor(
+    task_id='input_data_sensor',
+    filepath=devices_file_location + '/{{ ds_nodash }}/dataset.csv',  # ★ 핵심
+)
+input_data_sensor >> load_data_to_table >> refresh_aggregates
+```
+
+- 실행 순서로 읽기:
+    - ① producer DAG : `load_new_devices...`가 정제 파일을 `.../20250703/dataset.csv` 경로에 기록.
+    - ② consumer DAG : `FileSensor`가 그 경로를 주기적으로 확인하며 파일 생길 때까지 대기.
+    - ③ 파일 감지 → consumer의 `load_data_to_table >> refresh_aggregates` 진행.
+- ★핵심 : `filepath=...dataset.csv`
+    - 두 DAG가 코드로 연결돼 있지 않다. 이 파일 경로가 유일한 접점.
+    - consumer는 producer 존재를 모른다. "경로에 파일 있냐"만 본다 → 결합도 최소.
+- 각주(곁가지):
+    - `ds_nodash` : 날짜를 코드에 박으면 매 실행마다 못 바꾸는 한계 때문에 나온 Airflow 예약 매크로. 실행일자를 `YYYYMMDD`로 자동 치환(고정 명칭, 내가 정하는 변수 아님).
+    - `>>` : 태스크 실행 순서 연산자.
+---
+
+- 예시 2) 태스크 기반(트리거) 의존성 (Example 6-5) — producer가 consumer를 직접 트리거
+
+```
+# devices_loader (제공자)
+# ★ 핵심: ExternalTaskMarker가 소비자 DAG 태스크를 직접 지목해 트리거
+success_execution_marker = ExternalTaskMarker(
+    task_id='trigger_downstream_consumers',
+    external_dag_id='devices_aggregator',         # 소비자 DAG ID 명시
+    external_task_id='downstream_trigger_sensor',
+)
+(input_data_sensor >> load_new_devices_to_internal_storage()
+ >> success_execution_marker)
+
+# devices_aggregator (소비자)
+parent_dag_sensor = ExternalTaskSensor(
+    task_id='downstream_trigger_sensor',
+    external_dag_id='devices_loader',
+    external_task_id='trigger_downstream_consumers',
+    allowed_states=['success'],                   # 제공자 성공 시에만 진행
+    failed_states=['failed', 'skipped'],
+)
+parent_dag_sensor >> load_data_to_table >> refresh_aggregates
+```
+
+- 코드 설명:
+    - `ExternalTaskMarker` : Producer 쪽. 소비자 DAG를 직접 지목해 트리거. 백필 시 소비자도 자동 재실행.
+    - `ExternalTaskSensor` : Consumer 쪽. 제공자 태스크 상태를 감시.
+    - `allowed_states=['success']` : 허용 상태. 제공자가 `success`일 때만 후속 진행.
+    - `failed_states=['failed', 'skipped']` : 실패 상태. 이 상태면 소비자도 즉시 실패 처리.
+- 특징: `external_dag_id`로 상대 DAG를 **명시적**으로 지목. 백필 자동화되지만 두 팀이 DAG ID·태스크 ID에 강결합.
+
+---
+
+- 두 방식 비교:
+    - 데이터 기반 : 파일 존재로 consumer 자발 시작 (결합도 낮음, 관계 비가시)
+    - 태스크 기반 : Producer가 Consumer 직접 트리거 (결합도 높음, 백필 자동화)
+
+
+### (5)최신트렌드
+
+- Airflow Datasets (2.4+)
+    - 배경: FileSensor는 파일 생길 때까지 경로를 계속 찔러본다(polling). consumer DAG가 많으면 워커 슬롯이 대기만 하며 낭비.
+    - 해결: producer가 "데이터셋 갱신"을 선언 → consumer DAG가 이벤트로 즉시 실행. 감시(pull)를 통보(push)로 전환.
+- OpenLineage
+    - 배경: 파일 경로로만 연결돼 관계가 코드에 안 드러남. DAG 수백 개면 "이 테이블 누가 쓰냐" 답 불가.
+    - 해결: 실행마다 읽고 쓴 데이터셋을 자동 수집 → 의존 그래프를 시각화. 도구 중립 표준이라 Airflow·Spark·dbt 혼재해도 수집됨.
+- Dagster (Software-Defined Assets)
+    - 배경: Airflow는 "태스크(무엇을 실행)" 중심이라 데이터 산출물 간 의존이 코드에 안 보임.
+    - 해결: "에셋(테이블·파일 산출물)" 중심으로 정의 → 산출물 의존이 곧 DAG. 팀 경계가 자동으로 그려짐.
+- 실무 선호:
+    - 이미 Airflow 사용 → Datasets로 폴링부터 제거. 도입 비용 최저.
+    - 조직 전체 리니지 필요 → OpenLineage 추가.
+    - 신규 구축·데이터 중심 설계 → Dagster. 단 기존 Airflow 자산 이관 비용 큼.
+- 엔지니어 독백:
+    
+    > 신입한테 하고 싶은 말. 도구부터 깔지 마라. 나도 예전에 "리니지 좋다더라" 하고 OpenLineage부터 붙였다가 아무도 안 봐서 방치됐다. 순서는 이거다. ① 먼저 FileSensor 폴링으로 슬롯 터지는 게 실제 문제인지 확인 → 맞으면 Datasets. ② 컬럼 하나 바꿀 때마다 "누가 쓰냐" 회의가 반복되면 → 그때 OpenLineage. ③ Dagster는 신규 프로젝트 아니면 건들지 마라. 돌아가는 Airflow 200개를 에셋으로 재작성하는 건 분기 하나 날리는 일이다. 도구는 겪은 고통에 맞춰 도입하는 거지, 트렌드라서 까는 게 아니다.
+
+
+
+
+
