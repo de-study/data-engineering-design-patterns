@@ -1,5 +1,3 @@
-# Ch06.데이터흐름 디자인패턴-II
-
 **CH06의 핵심 질문**
 - 여러 태스크를 어떤 순서로 실행할 것인가
 - 여러 파이프라인이 서로 어떻게 의존할 것인가
@@ -179,6 +177,32 @@ SELECT c, b, a FROM cba
 - 설명: 위치 기반이라 `a+c`, `b+b`, `c+a`로 잘못 결합됨. 에러 없이 오염된 데이터 생성.
 - 그래서 Spark는 `unionByName`을 별도 제공. 단 덜 알려져 기본 `UNION` 습관을 주의.
 
+> 뭔말?
+
+ - 결론: 기본 UNION은 **컬럼 이름이 아니라 위치(순서)로 합쳐서**, 순서만 어긋나면 엉뚱한 값이 조용히 섞인다.
+- 왜 위험한가 (배경):
+    - 초기 SQL UNION은 성능 때문에 단순 설계됐다. 컬럼 이름을 대조하지 않고 왼쪽부터 순서대로 짝지음.
+    - 그래서 두 쿼리의 컬럼 순서만 달라도 에러 없이 잘못 합쳐진다.
+- 예시로 보자:
+    - 테이블 A(`user_id, age`) : 값 `(1, 30)`
+    - 테이블 B(`age, user_id`) : 값 `(25, 2)` ← 컬럼 순서가 반대
+- 의도: `user_id`끼리, `age`끼리 합치기.
+- 기본 UNION 결과 (위치 기준, 1번째끼리·2번째끼리):
+
+```
+user_id, age
+1,  30      ← A: 정상
+25, 2       ← B: age(25)가 user_id 자리로, user_id(2)가 age 자리로 뒤바뀜
+```
+
+- 문제의 본질:
+    - `user_id=25, age=2`라는 말도 안 되는 행이 생겼는데 **에러가 안 난다.**
+    - 나이 2세, 유저ID 25... 다운스트림에서 며칠 뒤에야 발견된다.
+- 해결:
+    - Spark `unionByName` : 위치 무시, **컬럼 이름**으로 맞춰 합침. → 순서 반대여도 `user_id`끼리 정상 결합.
+- 엔지니어 독백:
+    
+    > 신입한테. 같은 `SELECT` 복붙해서 UNION하면 순서가 같으니 안 터진다. 근데 브랜치마다 손으로 컬럼 짠 걸 합칠 땐 무조건 `unionByName`이다. 위치 기반은 틀려도 조용해서, 사고 나면 원인 찾는 데만 하루 날린다.
 ---
 
 - 엔지니어 독백:
@@ -234,35 +258,44 @@ SELECT c, b, a FROM cba
 
 ### (2)솔루션
 
-- 주요컨셉: "언제 시작하나"의 조건을 오케스트레이터가 '전부 성공'에서 '전부 완료'로 완화하고, '완성도'는 처리 계층이 플래그로 표시한다.
-- 완화 방식 (트리거 조건):
-    - 배경: 정렬된 팬인은 부모 전부 성공을 요구해, 한 브랜치 실패가 전체를 막았다.
-    - 해결: 트리거 조건을 '성공' 대신 '완료(성공+실패 무관)'로 바꿔 자식을 진행.
-- 완화 후 두 시나리오:
-    - 일부 성공 + 나머지 실패 허용 → 부분 입력으로 자식 실행 (부분 데이터셋 생성)
-    - 전부 실패 → 성공 기준이 아닌 실패 기준 태스크 실행 (폴백·에러 처리)
-- 완성도 알림 방식 (선택지):
-    - 컴패니언 완성도 테이블 : 별도 테이블에 "24개 중 12개 성공 = 50%" 기록
-    - 메타데이터 태그 : 클라우드 오브젝트 스토리지 객체 태그로 완성도 부착
-    - 다운스트림 알림 : 이메일 등으로 부분 상태 통보
-    - 비공개 처리 : 완성도 100% 아니면 내부 테이블에만 쓰고 외부 미공개
+- 주요컨셉: orchestrator는 trigger rule을 `ALL_SUCCESS`에서 `ALL_DONE`으로 완화해 partial 데이터를 만들고, 처리 계층은 그 partial 여부를 `is_partial` 플래그로 소비자에게 알린다.
+- 1단계 — trigger rule 완화:
+    - 배경: `ALL_SUCCESS`(Airflow 기본값)는 부모 전부 성공을 요구해, 한 브랜치 fail이 그날 집계 전체를 막았다.
+    - `ALL_DONE` 정의: 부모가 성공이든 fail이든 **끝나기만** 하면 자식 실행. success만 세지 않음.
+    - 결과: 23개 success + 1개 fail이어도 병합 진행.
+- 2단계 — 왜 완성도 플래그가 필수인가:
+    - `ALL_DONE`의 부작용: 소비자는 도착한 데이터가 complete인지 partial인지 구분 불가.
+    - 소비자는 데이터가 오면 complete로 가정 → partial 데이터로 잘못된 결론.
+    - 따라서 partial 여부를 알리는 장치 필수.
+- 예시 (완성도 표시):
+    - `visits_raw`에서 처리된 시간 수를 센다.
+    - 24개 다 처리 → `is_partial = false`
+    - 20개만 처리 → `is_partial = true` (4시간 누락)
+    - 소비자는 `WHERE is_partial = false`로 partial 데이터 배제.
+- 3단계 — 완성도 알림 방식 (선택지):
+    - flag 컬럼(`is_partial`) : 결과 테이블에 컬럼 추가.
+    - metadata tag : object storage 객체 태그로 부착. 데이터 본문 미변경.
+    - downstream 알림 : 이메일 등으로 partial 상태 통보.
+    - 비공개 : complete 아니면 외부 미공개, 내부 테이블만 기록.
 - 실무 선호:
-    - 소비자가 SQL로 바로 필터링해야 함 → 완성도 테이블/플래그 컬럼. 쿼리로 부분 데이터 배제 가능해서.
-    - 파일 기반 레이크 → 메타데이터 태그. 데이터 안 건드리고 상태만 붙일 수 있어서.
+    - 소비자가 SQL 필터링 → `is_partial` flag 컬럼. `WHERE is_partial = false`로 즉시 배제.
+    - 파일 기반 lake → metadata tag. 데이터 재작성 없이 상태만 갱신.
 
 
 ### (3)결과
 
-- 결론: 실패를 허용한 대가로 단점 2가지가 생긴다.
+- 결론: fail을 허용한 대가로 단점 2가지가 생긴다.
 - 가독성 저하:
-    - 배경: 정렬된 팬인은 "전부 성공"이 기본이라 그래프만 봐도 의도가 보였다.
-    - 문제: 완화 규칙은 코드 속 트리거 설정에만 있고 그래프엔 안 드러난다. "성공 시 태스크"와 "실패 시 태스크"를 둘 다 붙이면 흐름이 더 헷갈린다.
-    - 대응: 오케스트레이터가 제공하는 실패 전용 훅 사용. Airflow `on_failure_callback`, AWS Step Functions `Catch` 필드.  
-        
-- 부분 데이터 완성도 누락:
-    - 배경: 소비자는 데이터가 오면 완전하다고 가정한다.
-    - 문제: 부분임을 안 알리면 소비자가 불완전 데이터로 잘못된 결론을 낸다.
-    - 대응: 완성도 플래그(`is_partial`/`is_approximate`)를 반드시 부착.
+    - 배경: `ALL_SUCCESS` 기본값일 땐 그래프만 봐도 "전부 성공해야 다음"이 읽혔다.
+    - 문제: `ALL_DONE` 완화는 코드 속 옵션에만 있고 그래프엔 안 보인다. success 태스크 + fail 태스크를 둘 다 붙이면 흐름이 더 꼬인다.
+    - 대응: fail 전용 훅 사용. Airflow `on_failure_callback`, AWS Step Functions `Catch`
+- partial 데이터 완성도 누락:
+    - 배경: 소비자는 데이터가 오면 complete로 가정한다.
+    - 문제: partial임을 안 알리면 소비자가 불완전 데이터로 잘못된 결론.
+    - 대응: `is_partial` / `is_approximate` 플래그 필수 부착.
+- 엔지니어 독백:
+    
+    > 이거 내가 실제로 당한 썰 하나 푼다. 예전에 `ALL_DONE`으로 완화해놓은 DAG를 딴 사람이 만들어놨는데, 나는 그것도 모르고 "왜 3시간 fail 났는데 집계가 나가지?" 하고 반나절을 팠다. 그래프엔 아무 표시도 없거든. 결국 코드 열어서 trigger rule 한 줄 보고 알았다. 그날 이후로 나는 `ALL_DONE` 쓰면 태스크 이름을 `merge_allow_partial`처럼 대놓고 바꾸거나 doc에 박아둔다. 완화 규칙은 숨으면 무조건 사고 난다. 그리고 `is_partial` 플래그 없이 partial 내보내는 건 진짜 하지 마라 — 완전한 줄 알고 리포트 나간 다음에 "사실 4시간 빠졌어요" 하는 순간 신뢰가 끝난다.
 
 
 
@@ -285,22 +318,68 @@ for hour_to_load in [f"{hour:02d}" for hour in range(24)]:
     - 배경: Airflow 기본값은 `ALL_SUCCESS`(부모 전부 성공해야 시작).
     - 동작: `ALL_DONE`은 성패 무관, 부모가 전부 '끝나기만' 하면 자식 실행.
     - 함정: 규칙이 코드에만 있어 그래프론 안 보임.
-- 예시 2) 완성도 플래그 계산 (Example 6-10, SQL)
 
+
+
+
+- 예시 2) 완성도 플래그 계산 (Example 6-10, SQL)
+결론: 이 SQL은 **집계 결과를 저장하면서, "24시간 다 처리됐는지"를 세어 `is_approximate` 값으로 같이 박는 코드**다.
+
+한 줄 요약:
+- 집계(cube)를 만들면서, 처리된 시간 수를 세서 24 미만이면 `is_approximate = true`를 붙인다.
 ```
 INSERT INTO dedp.visits_cube (..., is_approximate)
 SELECT ...,
   (SELECT CASE WHEN cnt.all_hours = 24 THEN false ELSE true END
    FROM (SELECT COUNT(DISTINCT execution_time_hour_id) AS all_hours
          FROM dedp.visits_raw
-         WHERE execution_time_id = '{{ ds }}') AS cnt)
+         WHERE execution_time_id = '{{ ds }}') AS cnt) -- ★ 핵심
 FROM dedp.visits_raw GROUP BY CUBE(...);
 ```
 
-- 설명: 서브쿼리로 처리된 시간 수를 센다. 24면 `false`(완전), 아니면 `true`(부분).
-- `is_approximate` : 부분 여부 플래그 컬럼. 소비자가 이 컬럼으로 부분 데이터 필터링.
-- 예시 3) 덜 선언적인 구현 (Example 6-11, AWS Step Functions + Lambda)
+- 실행 순서:
+    - ① 안쪽 서브쿼리 : 그날(`ds`) `visits_raw`에 실제 들어온 시간 수를 센다. `COUNT(DISTINCT execution_time_hour_id)`.
+    - ② `CASE` : 그 수가 24면 `false`(complete), 아니면 `true`(partial).
+    - ③ 바깥 `SELECT` : 집계 결과를 만들면서 각 행에 ②의 값을 `is_approximate` 컬럼으로 붙인다.
+    - ④ `INSERT` : 완성된 결과를 `visits_cube`에 저장.
+- ★ 핵심: 안쪽 서브쿼리.
+    - 여기서 "몇 시간 처리됐나"를 세는 게 partial 판정의 전부다. 이 한 덩어리가 완성도를 결정한다.
+- 각주 (용어):
+    - `execution_time_hour_id` : 시간 파티션 식별자. 24개면 0~23시 전부 도착.
+    - `{{ ds }}` : Airflow 매크로. 실행일자(`YYYY-MM-DD`)로 자동 치환. 내가 정하는 변수 아님.
+    - `GROUP BY CUBE(...)` : 여러 컬럼 조합의 소계를 한 번에 만드는 집계 방식. 배경 — 조합별로 쿼리 여러 번 돌리던 걸 한 번에 처리하려고 나옴.
+```
+execution_time_id | execution_time_hour_id | visits
+2025-07-04        | 00                     | 50
+2025-07-04        | 01                     | 60
+2025-07-03        | 23                     | 40   
+```
 
+
+- 예시 데이터 (24시간 다 처리된 날 = complete):
+```
+execution_time_id | page   | country | visits | is_approximate
+2025-07-03        | /home  | KR      | 1200   | false
+2025-07-03        | /blog  | US      | 340    | false
+```
+
+- 예시 데이터 (20시간만 처리된 날 = partial):
+```
+execution_time_id | page   | country | visits | is_approximate
+2025-07-04        | /home  | KR      | 980    | true    ← 4시간 누락, 값 불완전
+2025-07-04        | /blog  | US      | 260    | true
+```
+
+- consumer 활용:
+    - `WHERE is_approximate = false` → complete 데이터만 조회.
+    - 위 예시면 7/4 행은 자동 배제됨.
+
+
+
+
+- 예시 3) 덜 선언적인 구현 (Example 6-11, AWS Step Functions + Lambda)
+결론: **Airflow의 `ALL_DONE`을 못 쓰는 환경(AWS Step Functions)에서,
+partial 여부를 코드로 직접 판단**하는 예시
 ```
 # lambda-table-creator
 def lambda_handler(event, context):
@@ -309,11 +388,45 @@ def lambda_handler(event, context):
         table_metadata['is_partial'] = True  # 부분 플래그 부착
     return True
 ```
+<1단계>
+- 배경:
+    - Airflow는 `ALL_DONE` 한 줄로 "fail 나도 진행"을 선언적으로 처리했다.
+    - AWS Step Functions에는 그런 trigger rule 옵션이 없다.
+    - 그래서 "일부 실패해도 진행 + partial 표시"를 **코드(Lambda)로 직접** 구현해야 한다.
+- 등장 컴포넌트 (Lambda 3개, 각 역할):
+    - Lambda ①(partition detector) : 처리할 시간 파티션들을 찾는다.
+    - Lambda ②(processor) : 파티션별로 처리하고, 성공/실패를 `true`/`false`로 반환한다.
+    - Lambda ③(table-creator) : ②의 결과들을 모아, 하나라도 `false`면 `is_partial=true`를 붙인다.
+- 위 코드(`lambda_handler`)의 정체:
+    - 세 번째 Lambda ③(table-creator)다.
+    - `event['ProcessorResults']` : ②가 반환한 성패 리스트(예: `[true, true, false, ...]`).
+    - `if False in ...` : 그 리스트에 `false`가 하나라도 있으면 partial로 판정.
 
-- 설명: Lambda 3개 구조. 파티션 탐지 → 파티션별 처리(성패 bool 반환) → 결과 취합. 처리 결과에 `False`가 하나라도 있으면 `is_partial=True`.
-- Airflow처럼 선언적 트리거 규칙이 없어, 성패를 코드로 직접 평가.
+<2단계>
+- 입력 (`event`):
+
+```
+event = {
+    "ProcessorResults": [true, true, false, true]   -- Lambda ②가 반환한 파티션별 성패
+}
+```
+
+- 실행 순서:
+    - ① `table_metadata = {}` : 빈 메타데이터 딕셔너리 생성.
+    - ② `if False in event['ProcessorResults']` : 성패 리스트에 `false`가 있는지 검사. 위 예시는 3번째가 `false` → 참.
+    - ③ `table_metadata['is_partial'] = True` : partial로 판정, 플래그 부착.
+    - ④ `return True` : 처리 완료 신호 반환.
+- ★ 핵심: `if False in event['ProcessorResults']`
+    - 이 한 줄이 partial 판정의 전부.
+    - Airflow `ALL_DONE`은 orchestrator가 자동 판정했지만, Step Functions엔 그 기능이 없어 **리스트에 fail이 있나를 코드로 직접 검사**한다.
+- 두 방식 비교:
+    - Airflow : `trigger_rule=ALL_DONE` 선언 → orchestrator가 판정 (선언적)
+    - Step Functions : `if False in ...` → 코드가 판정 (명령적, 덜 선언적)
 - 엔지니어 독백:
-    
+
+    > 신입한테. Step Functions 같은 환경엔 Airflow의 trigger rule 같은 편의 기능이 없다. 그래서 "실패 허용" 로직을 매번 Lambda에 손으로 짠다. 이런 코드 볼 때 나는 "이게 orchestrator가 해줄 일을 대신하는구나"로 읽는다. 도구가 안 해주면 사람이 짜는 거다.
+
+- 엔지니어 독백:
     > 신입한테. `ALL_DONE`은 그래프 봐선 절대 안 보인다. 나는 이런 완화 규칙 쓸 때 태스크 이름이나 doc_md에 "부분 허용" 흔적을 꼭 남긴다. 안 그러면 6개월 뒤 내가 봐도 "얘는 왜 실패했는데 다음이 돌지?" 하고 헤맨다.
     
 
@@ -322,21 +435,51 @@ def lambda_handler(event, context):
 
 
 ### (5)최신트렌드
+엔지니어 독백:
 
-- 결론: 완성도 관리를 수동 플래그에서 테이블 메타데이터·데이터 품질 도구로 옮기는 흐름.
-- Delta Lake / Iceberg 테이블 속성:
-    - 배경: `is_partial` 컬럼은 행마다 붙어 관리가 번거롭고 소비자가 놓치기 쉬웠다.
-    - 해결: 테이블 단위 메타데이터 속성에 완성도 기록. 데이터 안 건드리고 상태만 관리.
-- 데이터 품질 도구 (Great Expectations, dbt tests):
-    - 배경: 부분 데이터 여부를 소비자가 매번 수동 확인했다.
-    - 해결: "24시간 완비" 같은 기대치를 테스트로 선언. 미충족 시 자동 경고·차단.
-- 데이터 컨트랙트 + 완성도 SLA:
-    - 배경: 부분 데이터 통보가 이메일 등 비공식 채널에 의존했다.
-    - 해결: 완성도 기준을 계약으로 명문화. 소비자가 자동으로 상태 인지.
-- 실무 선호:
-    - 이미 레이크하우스(Delta/Iceberg) 사용 → 테이블 속성. 도입 비용 최저.
-    - 파이프라인 신뢰성 강화 목적 → Great Expectations/dbt tests.  
-        
-- 엔지니어 독백:    
-    > 신입한테. 부분 데이터는 "표시"보다 "차단" 기준을 먼저 정해라. 완성도 50% 밑이면 아예 안 내보내는 게 나을 때가 많다. 반쪽 데이터가 대시보드에 뜨는 순간 그걸로 의사결정 나버린다.
+> 신입한테 요즘 현업 분위기 말해준다.
+> 
+> 예전엔 partial 여부를 `is_partial` 컬럼으로 매 row에 박았다. 이게 진짜 별로였다. consumer가 `WHERE` 한 줄 까먹으면 그냥 partial 데이터로 리포트 나간다. 사람 실수에 의존하는 구조라 늘 불안했다.
+> 
+> 요즘은 Delta Lake나 Iceberg를 많이 쓴다. 왜 좋냐면, 완성도를 row가 아니라 **write(commit/snapshot) 단위**로 붙일 수 있다. "이 write 자체가 partial이다"가 데이터에 딱 박히니까, consumer가 컬럼 필터 안 걸어도 놓칠 일이 없다. 기존 컬럼 방식의 "놓치기 쉬움"을 구조적으로 없앤 거라 체감이 크다.
+> 
+> 그리고 요즘 트렌드는 partial을 **표시**하는 걸 넘어 아예 **막는** 쪽이다. Great Expectations나 dbt test를 파이프라인에 꽂아두면 "24시간 안 채워지면 run을 fail시켜라"를 걸 수 있다. partial이 consumer한테 도달조차 안 한다. 나는 매출 같은 민감 데이터는 무조건 이걸로 막는다. 반쪽 데이터가 대시보드에 뜨는 순간 그걸로 의사결정 나버리거든.
+> 
+> 정리하면 — 표시만 필요하면 Delta/Iceberg metadata, 아예 막아야 하면 test gate. 요즘은 "믿을 만한 데이터만 내보낸다"는 쪽으로 무게가 실린다.
+
+
+
+- 결론: 요즘은 completeness를 row 플래그가 아니라 **table 메타데이터** 또는 **test gate**로 관리한다.
+- Delta Lake / Iceberg 메타데이터:
+    - 이전 한계: `is_partial` per-row column은 consumer가 `WHERE` 필터를 까먹으면 partial 데이터가 그대로 새어나갔다.
+    - 왜 요즘 쓰나: completeness를 write(commit/snapshot) 단위로 붙여, row 필터 없이도 write 자체가 partial인지 판별된다.
+- Great Expectations / dbt tests:
+    - 이전 한계: partial 여부를 consumer가 매번 수동 확인했다.
+    - 왜 요즘 쓰나: "24 hours 완비" 같은 조건을 test로 걸어, 미충족 시 run을 fail시켜 partial을 아예 차단한다. 표시(flag)가 아니라 차단(gate).
+- 실무 선호 (상황별):
+    - consumer가 partial도 보되 구분만 필요 → Delta/Iceberg 메타데이터. write 단위 상태가 native라 도입 비용 최저.
+    - partial을 아예 내보내면 안 됨(매출 등 민감 데이터) → GE/dbt test gate.
+
+> 저게 뭐지?
+
+
+Great Expectations:
+- 정체: Python 기반 data validation 프레임워크.
+- 이전 한계: 데이터 검증을 사람이 SQL로 매번 눈으로 확인했다. 누락·중복을 놓치기 쉬웠다.
+- 하는 일: "이 컬럼은 null 없어야 함", "row 수 24개여야 함" 같은 expectation을 코드로 선언 → 자동 검사.
+
+dbt tests:
+- 정체: SQL 변환 도구 dbt(data build tool)에 내장된 test 기능.
+- 이전 한계: SQL 변환 결과의 정합성을 사람이 사후 확인했다.
+- 하는 일: 모델에 `unique`, `not_null`, `row_count` 같은 test를 붙여 → 빌드 시 자동 검사, 실패 시 run 중단.
+
+이 패턴에서의 역할:
+- "24 hours 완비" 조건을 test로 건다.
+- 미충족이면 run을 fail → partial 데이터가 consumer로 못 나감.
+- 즉 flag(표시)가 아니라 gate(차단) 방식.
+
+
+- 엔지니어 독백:
+    
+    > 신입한테. flag는 "보이게", gate는 "못 나가게"다. 매출처럼 잘못 나가면 끝나는 데이터는 무조건 gate로 막아라. partial이 대시보드에 뜨는 순간 그걸로 의사결정 나버린다. 반대로 로그 분석처럼 partial도 쓸모 있으면 metadata로 열어두고 consumer가 판단하게 둔다. 요즘 분위기는 "믿을 데이터만 내보낸다"로 기운다.
     
