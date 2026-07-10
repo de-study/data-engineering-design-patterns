@@ -23,22 +23,19 @@
 > 데이터 가치·데이터 흐름 패턴으로 만든 **접근하기 쉽고 가치 있는 데이터셋** 은 중요한 비즈니스 자산이자,
 > **악의적 행위자를 포함한** 다른 시장 참여자들의 시샘 대상이기도 함. 그래서 데이터 엔지니어링은 처리 잡을 짜는 데서 멈출 수 없음.
 
-- **Compliance (규정 준수)** — 최근 몇 년간 큰 주목을 받은 영역. **GDPR(유럽)**·**CCPA(미국)** 같은 데이터 프라이버시 법이
-  **나(데이터 프로바이더)와 고객(데이터 컨슈머)** 사이의 경계를 정밀하게 규정.
-- **Access control (접근 제어)** — 조직 안에서 데이터셋이 열려 있으면 **다른 팀이 실수로 덮어쓸** 수 있고,
-  그 여파가 나와 다운스트림 컨슈머 모두에게 큼.
-- **Data protection (데이터 보호)** — 데이터셋 위치 접근권을 실수로 줘도, **암호화** 같은 보호 계층을 더해 뒀다면
-  컨슈머는 **복호화 키** 가 있어야 데이터를 읽을 수 있음.
+- **Compliance (규정 준수)** — 최근 몇 년간 큰 주목을 받은 영역. **GDPR(유럽)**·**CCPA(미국)** 같은 데이터 프라이버시 법이 **나(데이터 프로바이더)와 고객(데이터 컨슈머)** 사이의 경계를 정밀하게 규정.
+- **Access control (접근 제어)** — 조직 안에서 데이터셋이 열려 있으면 **다른 팀이 실수로 덮어쓸** 수 있고, 그 여파가 나와 다운스트림 컨슈머 모두에게 큼.
+- **Data protection (데이터 보호)** — 데이터셋 위치 접근권을 실수로 줘도, **암호화** 같은 보호 계층을 더해 뒀다면 컨슈머는 **복호화 키** 가 있어야 데이터를 읽을 수 있음.
 - **Connectivity (연결성)** — 사람이든 애플리케이션이든 데이터 저장소에 연결해 읽고 씀.
   **자격 증명(credentials)을 Git 저장소에 두면** 유출 위험이 커짐 → 외부의 더 안전한 곳에 보관해야 함.
 
 ```
 [챕터 7 데이터 보안 패턴 — 네 카테고리]
 ──────────────────────────────────────────────────────────────────────
- 7.1 Data Removal     잊힐 권리 대응(개인정보 삭제)   #41 Vertical Partitioner / #42 In-Place Overwriter
+ 7.1 Data Removal     잊힐 권리 대응(개인정보 삭제)      #41 Vertical Partitioner / #42 In-Place Overwriter
  7.2 Access Control   세밀한 접근 제어                #43 Fine-Grained Accessor (Tables/Resources #44)
  7.3 Data Protection  암호화·익명화                   #45 Encryptor / #46 Anonymizer / #47 Pseudo-Anonymizer
- 7.4 Connectivity     자격 증명 없이 안전하게 연결      #48 Secrets Pointer / #49 Secretless Connector
+ 7.4 Connectivity     자격 증명 없이 안전하게 연결       #48 Secrets Pointer / #49 Secretless Connector
 ──────────────────────────────────────────────────────────────────────
  본 문서: 7.1 Data Removal 의 Vertical Partitioner(#41) 만 다룸.
 ```
@@ -67,8 +64,8 @@
 
 ## 1. 데이터 제거 (Data Removal)
 
-CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의하는데, 그중 하나가 **개인정보 삭제 요청(personal data removal request)** —
-사용자로부터 삭제 요청을 받으면 그 사용자의 데이터를 **지워야** 함. 이 절은 그 요구를 다루는 **두 구현 접근** 을 소개.
+CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의하는데, 그중 하나가 **개인정보 삭제 요청(personal data removal request)**
+— 사용자로부터 삭제 요청을 받으면 그 사용자의 데이터를 **지워야** 함. 이 절은 그 요구를 다루는 **두 구현 접근** 을 소개.
 
 - **#41 Vertical Partitioner** — 데이터 조직을 **컬럼 단위로 분리** 해 삭제할 개인정보를 최소화 (아래 1-1 절).
 - **#42 In-Place Overwriter** — 리팩터링 여유가 없을 때 **기존 저장소를 제자리에서 덮어써** 삭제 (본 문서 범위 밖).
@@ -101,8 +98,8 @@ CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의
   - ① **쪼갤 컬럼** 과, 나중에 쪼갠 row 들을 **다시 합칠 때 쓸 속성**(예: `user_id`)을 식별.
   - ② 데이터 수집 잡에 **속성 기반 split 로직** 을 추가 — 한 row 를 두 부분으로 나눠 **각각 별도 저장소** 에 씀.
     매 레코드마다 값이 달라지는 **event 속성** 은 한 저장소로, 안 바뀌는 것·**개인정보 범위** 에 속하는 것은 다른 곳으로.
-- **가장 쉬운 구현** — `SELECT` 문(또는 데이터 처리 프레임워크의 attribute projection). **여러 쿼리** 를 날려
-  각각 **다른 컬럼 집합** 을 타깃으로 잡아 **다른 데이터스토어** 에 씀. 각 쿼리에 **중복 제거(dedup)** 같은 비즈니스 규칙을 붙일 수 있음.
+- **가장 쉬운 구현** — `SELECT` 문(또는 데이터 처리 프레임워크의 attribute projection). 
+  **여러 쿼리** 를 날려 각각 **다른 컬럼 집합** 을 타깃으로 잡아 **다른 데이터스토어** 에 씀. 각 쿼리에 **중복 제거(dedup)** 같은 비즈니스 규칙을 붙일 수 있음.
 
 ```
 [Figure 7-1 재현] Vertical Partitioner — PII·불변 속성을 전용 저장소로 분리
@@ -115,14 +112,14 @@ CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의
                                  visited_page: home.html
                                        │  vertical partitioning
                      ┌─────────────────┴─────────────────┐
-                     ▼                                    ▼
+                     ▼                                   ▼
            event_id: 1029384                     user_id: 10
            user_id: 10                           address: 12, Dummy Street
            action: click                         city: Neverland
            visited_page: home.html
-                     │                                    │
-                     ▼                                    ▼
-              [ Event data ]                        [ PII data ]
+                     │                                   │
+                     ▼                                   ▼
+              [ Event data ]                       [ PII data ]
 ──────────────────────────────────────────────────────────────────────
  매 레코드마다 값이 바뀌는 event 속성 → Event data, 안 바뀌는 PII·불변 속성 → PII data.
  user_id 는 양쪽에 남겨, 컨슈머가 나중에 두 조각을 다시 join 하는 키로 씀.
@@ -146,7 +143,7 @@ CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의
    ⇒ 삭제 요청 시 user_id=10 의 1,000행을 스캔·수정
 
  ✓ 수직 분할 (두 저장소)
-   Event data (1,000행, 개인정보 없음)      PII data (user_id 당 1행)
+   Event data (1,000행, 개인정보 없음)         PII data (user_id 당 1행)
    visit_id | user_id | action | page      user_id | address       | city
    1        | 10      | click  | home      10      | 12, Dummy St  | Neverland   ← 개인정보 1벌만
    2        | 10      | scroll | post
@@ -157,7 +154,7 @@ CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의
 
 #### 고려사항 (Consequences)
 
-삭제 use case 에는 좋은 성능 최적화지만, **컨슈머(조회하는 쪽)** 에겐 몇 가지 단점이 따름.
+삭제 use case 에는 좋은 성능 최적화지만, **컨슈머 (조회하는 쪽)** 에겐 몇 가지 단점이 따름.
 
 - **Query performance (조회 성능)**
   - 수직 파티셔닝은 일종의 **데이터 정규화(normalization)** — 불변 속성이 가변 속성과 **따로 떨어져** 삶.
@@ -181,7 +178,7 @@ CCPA·GDPR 같은 프라이버시 규정은 여러 준수 요구사항을 정의
 ```
 [Figure 7-2 재현] Polyglot persistence + vertical partitioning
 ──────────────────────────────────────────────────────────────────────
-                          ┌─► Immutable personal data ─► RDBMS writer        ─► [ Mutable | Immutable ]
+                          ┌─► Immutable personal data ─► RDBMS writer         ─► [ Mutable | Immutable ]
  Input raw ─► Vertical ───┤
       data    partitioner └─► Mutable data            ─► Search engine writer ─► [ Search engine ]
 ──────────────────────────────────────────────────────────────────────
@@ -260,20 +257,20 @@ docker exec -ti ... kafka-console-producer.sh --bootstrap-server .... \
 140665101097856_0316986e-9e7c-448f-9aac-5727dde96537,NULL
 ```
 
-> compaction 후 그 `user_id` 는 토픽에서 사라짐. 단 이 방식은 **key 당 한 개** 인 `user_context` 토픽에서만 유효 —
-> `visits` 처럼 **여러 이벤트가 같은 visit id key 를 공유** 하는 토픽에 compaction 을 걸면 **마지막 방문만 남아** 데이터가 훼손됨.
+> compaction 후 그 `user_id` 는 토픽에서 사라짐. 단 이 방식은 **key 당 한 개** 인 `user_context` 토픽에서만 유효
+> — `visits` 처럼 **여러 이벤트가 같은 visit id key 를 공유** 하는 토픽에 compaction 을 걸면 **마지막 방문만 남아** 데이터가 훼손됨.
 
 ```
 [Examples 7-1 ~ 7-4 한 흐름 — 분리부터 삭제까지]
 ──────────────────────────────────────────────────────────────────────
  raw visits ─► split_visit_attributes (7-1, foreachBatch)
-                  ├─► visits 토픽        (key=visit_id · 가변 event, 개인정보 제거)
+                  ├─► visits 토픽         (key=visit_id · 가변 event, 개인정보 제거)
                   └─► user_context 토픽   (key=user_id · 불변 PII)
                              │
                              ▼  MERGE + dropDuplicates(user_id)  (7-2)
                      [ Delta users 테이블 ]   ← user_id 당 1건으로 정리
                              │
-        삭제 요청 ──────────►│  delete(user_id = ...)  (7-3)  ─► + VACUUM (물리 삭제)
+        삭제 요청 ──────────►  │  delete(user_id = ...)  (7-3)  ─► + VACUUM (물리 삭제)
                              │
    (Kafka 저장이면)  tombstone  user_id,NULL  ─► compaction 이 제거  (7-4)
 ──────────────────────────────────────────────────────────────────────
@@ -296,12 +293,12 @@ docker exec -ti ... kafka-console-producer.sh --bootstrap-server .... \
 ## 2. 요약
 
 챕터 7의 데이터 보안 패턴은 **"만든 데이터 자산을 어떻게 지키나"** 를 다루며, 그 첫 카테고리가 **데이터 제거(잊힐 권리)**.
-#41 **Vertical Partitioner** 는 삭제를 "어떻게 지우나" 가 아니라 **"지울 대상을 어떻게 적게 만드나"** 로 뒤집는 패턴 —
-불변 개인정보를 **컬럼 단위로 떼어 딱 한 번만** 저장해, 삭제 요청 시 **PII 저장소의 한 행** 만 지우면 되게 함.
+#41 **Vertical Partitioner** 는 삭제를 "어떻게 지우나" 가 아니라 **"지울 대상을 어떻게 적게 만드나"** 로 뒤집는 패턴
+— 불변 개인정보를 **컬럼 단위로 떼어 딱 한 번만** 저장해, 삭제 요청 시 **PII 저장소의 한 행** 만 지우면 되게 함.
 
 | 패턴 | 카테고리 | 한 줄 요약 | 핵심 트레이드오프 |
 |---|---|---|---|
-| #41 Vertical Partitioner | Data Removal | 가변 event ↔ 불변 PII 를 컬럼 단위로 분리해 삭제 대상 최소화 | 쓰기·삭제 비용↓ / 읽기 시 join·네트워크 비용↑·조회 복잡도(원본 데이터 보존 별도 관리) |
+| #41 Vertical Partitioner | Data Removal | 가변 event ↔ 불변 PII 를 컬럼 단위로 분리해 삭제 대상 최소화 | 쓰기·삭제 비용↓ / <br>읽기 시 join · 네트워크 비용↑ · 조회 복잡도 (원본 데이터 보존 별도 관리) |
 
 ```
 [#41 한눈에 — 지울 데이터를 애초에 줄인다]
@@ -310,7 +307,7 @@ docker exec -ti ... kafka-console-producer.sh --bootstrap-server .... \
  ✓ Vertical 분할   PII 는 user_id 당 1건(PII data) + 가변 event 는 따로(Event data)
                    ⇒ 삭제 요청 = PII data 의 그 user_id 한 행 delete (+ VACUUM / tombstone)
 ──────────────────────────────────────────────────────────────────────
- 대가 — 조회 시 두 조각을 user_id 로 다시 join(네트워크·복잡도). view·data catalog·리니지로 완화.
+ 대가 — 조회 시 두 조각을 user_id 로 다시 join(네트워크·복잡도). view ·data catalog·리니지로 완화.
 ```
 
 **정리** — Vertical Partitioner 는 **삭제 최적화** 를 위한 **쓰기 시점의 데이터 조직** 선택이고,
