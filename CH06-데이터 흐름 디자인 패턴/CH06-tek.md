@@ -16,10 +16,13 @@
    - 패턴 #36: 비정렬 팬인 (Unaligned Fan-In)
 3. [팬아웃 (Fan-Out)](#3-팬아웃-fan-out)
    - 패턴 #37: 병렬 분할 (Parallel Split)
-4. [요약](#4-요약)
+   - 패턴 #38: 배타적 선택 (Exclusive Choice)
+4. [오케스트레이션 (Orchestration)](#4-오케스트레이션-orchestration)
+   - 패턴 #39: 단일 실행기 (Single Runner)
+   - 패턴 #40: 동시 실행기 (Concurrent Runner)
+5. [요약](#5-요약)
 
-> 본 문서가 다루는 범위는 챕터 6 중 **#33 ~ #37** (6.1 Sequence · 6.2 Fan-In · 6.3 Fan-Out 의 Parallel Split).
-> 나머지(#38 Exclusive Choice, 6.4 Orchestration 의 #39 Single / #40 Concurrent Runner)는 후속 문서에서 다룸.
+> 본 문서는 챕터 6 **전체(#33 ~ #40)** 를 다룸 — 6.1 Sequence · 6.2 Fan-In · 6.3 Fan-Out · 6.4 Orchestration.
 
 ---
 
@@ -49,7 +52,7 @@
  6.3 Fan-Out     하나에서 여러 분기       #37 Parallel Split / #38 Exclusive Choice
  6.4 Orchestration 파이프라인 동시성 관리   #39 Single / #40 Concurrent Runner
 ──────────────────────────────────────────────────────────────────────
- 본 문서: 6.1 Sequence(#33·#34) · 6.2 Fan-In(#35·#36) · 6.3 Fan-Out 의 Parallel Split(#37)
+ 본 문서: 챕터 6 전체 — 6.1 Sequence(#33·#34) · 6.2 Fan-In(#35·#36) · 6.3 Fan-Out(#37·#38) · 6.4 Orchestration(#39·#40)
 ```
 
 ### 패턴 흐름 — 챕터 5에서 챕터 6 으로
@@ -782,7 +785,7 @@ def lambda_handler(event, context):
 하나의 데이터셋을 **여러 팀이 서로 다른 목적**(데이터 분석, 데이터 사이언스 등)으로 쓸 때 유용.
 
 - **#37 Parallel Split** — 한 부모에서 **둘 이상의 자식 브랜치를 병렬 실행**.
-- (#38 Exclusive Choice — 조건에 따라 **하나의 브랜치만** 실행. 본 문서 범위 밖.)
+- **#38 Exclusive Choice** — 조건에 따라 **하나의 브랜치만** 실행 (아래 3-2 절).
 
 ---
 
@@ -982,31 +985,441 @@ input_dataset.write.mode('append').format('delta')
 
 ---
 
-## 4. 요약
+### 3-2. 패턴 #38: 배타적 선택 (Exclusive Choice)
 
-챕터 6의 데이터 흐름 패턴은 **"만든 데이터 가치를 어떻게 잇고 공유하나"** 를 다룸.
-#33(Local Sequencer)이 **한 파이프라인 안의 순서** 였다면, #34~#37은 **파이프라인 경계를 넘고(팬인/팬아웃) 팀 경계를 넘는(독립 시퀀서)** 흐름을 조율함.
+> 두 번째 팬아웃 패턴. Parallel Split 과 똑같이 **하나의 공통 부모** 에 의존하지만,
+> 자식들을 **병렬로 다 돌리는 대신** 조건에 따라 **딱 하나만** 고름.
+
+#### 상황 (Problem)
+
+**책의 use case** — Parallel Split 로 끝낸 마이그레이션을 다시 진화시키는 경우:
+
+- #37 로 완성한 마이그레이션이 완벽히 잘 돌아감.
+- 이제 파이프라인을 진화시켜 **새 잡 버전** 을 **2024년 1월 1일부터만** 실행하려 함.
+- 단 **backfill** 할 때(과거 날짜 재처리)는 그 이전 날짜가 여전히 **예전(legacy) 잡** 으로 돌아야 함.
+- **결정적 제약**: 이 진화를 **새 파이프라인을 만들지 않고** 해내야 함 — 전체 실행 이력(execution history)을 한 곳에 유지하기 위해.
+
+#### 해결 (Solution)
+
+여전히 자식 태스크는 둘이지만, 이번엔 **한 번에 하나만** 돌아야 함 → **Exclusive Choice**.
+
+- **Parallel Split 과의 공통점** — 최소 둘 이상의 다운스트림 프로세스를 선언하는 것은 동일(오케스트레이터 DSL 또는 프로그래밍 언어 함수).
+- **결정적 차이 — 분기 직전 한 단계** — 마지막 공통 지점 바로 뒤에 자식들을 곧장 매다는 게 아니라,
+  **어느 경로로 갈지 정하는 조건 평가(condition evaluator) 태스크** 를 하나 끼워 넣음.
+- **도구 지원** — 현대 오케스트레이터는 분기 조건 평가를 기본 제공.
+  - Airflow(오픈소스) — 전용 태스크 타입인 **branch operator**.
+  - Azure Data Factory(서버리스) — **if condition activity** 로 구현.
+- **데이터 처리 레이어** — 훨씬 단순. 컴퓨트 레이어 언어의 **`if-else`/`switch`** 문을 그대로 씀.
+
+```
+[Figure 6-6 재현] Exclusive Choice — 날짜 조건으로 새 잡 vs 레거시 잡 택일
+──────────────────────────────────────────────────────────────────────
+                                            ┌─ Yes ─►  New job version    (새 잡)
+ Readiness marker ─► Is the date 2024-01-01? ┤
+                                            └─ No ──►  Legacy job version (레거시 잡)
+──────────────────────────────────────────────────────────────────────
+ 공통 부모(readiness) 뒤에 "조건 평가" 태스크를 두고, 결과에 따라 두 브랜치 중 하나만 실행.
+```
+
+**쉽게 풀어 보면 (마이그레이션 예 이어서)** — #37 Parallel Split 은 delta·csv 를 **둘 다** 썼지만,
+#38 Exclusive Choice 는 날짜(또는 조건)를 보고 **한 잡만** 고름. 둘 다 "공통 부모 + 여러 자식" 이지만 **실행 방식이 정반대**.
+
+| 비교 축 | Parallel Split (#37) | Exclusive Choice (#38) |
+|---|---|---|
+| 공통 부모 | 있음 | 있음 |
+| 자식 실행 | **둘 이상 병렬로 전부** | 조건 평가 후 **하나만** |
+| 분기 직전 | 곧장 분기 | **조건 평가 태스크** 를 삽입 |
+| 데이터 처리 구현 | `persist()` 후 두 브랜치 | `if-else` / `switch` |
+| 대표 위험 | 느린 브랜치가 전체를 막음 | 분기 남발로 가독성 급락 |
+
+#### 고려사항 (Consequences)
+
+가장 큰 위험은 이 패턴의 **유연성** 그 자체 — 브랜치를 원하는 만큼 추가할 수 있고, 브랜치가 많아지면 파이프라인 이해도가 급락.
+
+- **Complexity factory (복잡도 공장)**
+  - 앱 코드에서 `if-else` 를 여러 개 쓰는 건 흔해서, 오케스트레이션 레이어에도 똑같이 반복하고 싶어짐.
+    하지만 이 레이어에서 조건이 여러 개면 = **실행 브랜치가 여러 개** → 나중에 다시 합류하거나 더 갈라져 **컴포넌트가 거의 읽을 수 없게** 됨.
+  - `if-else` 조건 개수에 정해진 임계값은 없음. 이상 징후를 확인하는 법 —
+    **최근 합류한 가상의 동료에게 파이프라인을 설명** 해 보기. 설명이 간결하지 않고 질문·답변이 꼬리를 물면 파이프라인이 너무 복잡한 것.
+
+```
+[Exclusive Choice 남용 — 브랜치가 합류·재분기하며 읽을 수 없게 됨]
+──────────────────────────────────────────────────────────────────────
+ ✓ 절제된 분기 (조건 1개, 택일 후 곧장 합류)
+    readiness ─► 날짜? ─┬─ 이후 ─► new_job ─┐
+                       └─ 이전 ─► legacy  ─┴─► publish
+
+ ✗ 브랜치 스파게티 (조건 여러 개가 겹쳐 합류·재분기)
+    readiness ─► A? ─┬─Y─► jobA ─► B? ─┬─Y─► jobB ─┐
+                    └─N─► jobC ──┐     └─N─► jobD ─┼─► C? ─┬─► jobF
+                                └─────► jobE ──────┘      └─► jobG
+    ⇒ 그래프만 봐선 "어떤 조건일 때 무엇이 도나" 추적 불가 → 코드를 열어야 앎
+──────────────────────────────────────────────────────────────────────
+ 판단법 — 위 "가상 동료 설명" 이 간결하지 않으면, 분기를 별도 파이프라인으로 쪼갤 신호.
+```
+
+- **Hidden logic (숨은 로직)**
+  - 데이터 처리 구현에 해당. 잡 안에 조건문·분기가 들어가 **서로 다른 데이터셋을 만들거나 다른 출력 저장소** 와 상호작용하면 나중에 문제.
+  - 코드를 쓴 며칠·몇 주는 기억하지만, 시간이 지나면 **이 잡에 여러 결과 경로가 있다는 사실 자체를 잊음**.
+  - 그래서 Exclusive Choice 는 처리 레이어에 숨기기보다 **데이터 오케스트레이션 레이어 위에** 두는 편이 나음 (Example 6-16 vs 6-15).
+- **Heavy conditions (무거운 조건)**
+  - 데이터 처리 레이어에서 구현하는데 조건이 **데이터를 처리해야** 알 수 있으면 잡 실행 시간에 영향.
+    가능하면 **메타데이터 기반 조건**(데이터셋을 건드리지 않아 더 빠름)을 선호.
+  - 데이터 처리를 피할 수 없으면 — 여러 번 처리하지 않도록, 전체 데이터셋을 매번 읽지 않는 **증분 처리** 로 최적화.
+
+> **참고 사항 — Rubber Duck Debugging(고무 오리 디버깅)**
+> 가상의 동료(또는 책상 위 고무 오리)에게 소리 내어 설명하는 방법은 흔히 **디버깅 기법** 으로 알려져 있지만,
+> 파이프라인의 **복잡도를 진단** 하는 데도 똑같이 쓸 수 있음 — 설명이 장황해지면 그 자체가 "너무 복잡하다" 는 신호.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — 처리 레이어 vs 오케스트레이션 레이어 (Example 6-15 / 6-16)**
+
+같은 조건 분기라도 **어느 레이어에 두느냐** 가 유지보수를 가름:
+```python
+# Example 6-15 — 데이터 처리 레이어: 잡 "안"에 조건 분기 (숨은 로직 위험)
+if condition_a:
+    process_condition_a()
+else:
+    process_default()
+```
+```bash
+# Example 6-16 — 데이터 오케스트레이션 레이어(권장): 조건에 따라 "다른 진입점"을 실행
+if condition_a:
+    python job_for_condition_a.py
+else:
+    python job_for_default.py
+```
+
+> 오케스트레이션 레이어에 두면 그래프에서 분기가 **눈에 보임**. 처리 레이어에 숨기면 태스크는 하나로 보여 "숨은 로직" 이 됨.
+
+**예시 2 — Airflow BranchPythonOperator (Example 6-17)**
+
+`BranchPythonOperator` 가 실행 날짜에 따라 다음 브랜치를 **라우팅**:
+```python
+def get_output_format_route(**context):
+    migration_date = pendulum.datetime(2024, 2, 3)
+    execution_date = context['execution_date']
+    if execution_date >= migration_date:
+        return 'load_job_trigger_delta'   # 마이그레이션 날짜 이후 → 새 포맷(Delta)
+    else:
+        return 'load_job_trigger_csv'      # 이전 → 레거시 포맷(CSV)
+
+format_router = BranchPythonOperator(
+    task_id='format_router',
+    python_callable=get_output_format_route,
+    provide_context=True
+)
+```
+
+> 실행 날짜로 Delta/CSV 를 고름. 브랜치는 얼마든 늘릴 수 있지만 **늘수록 가독성이 떨어짐**.
+> 분기 대신 `start_date`·`end_date` 로 시간 유효성을 나눈 **별도 파이프라인** 을 만드는 선택지도 있음.
+
+**예시 3 — PySpark 잡 파라미터 + Factory (Example 6-18 / 6-19)**
+
+외부 파라미터(`--output_type`)로 브랜치를 고르고, 생성 로직은 **Factory 디자인 패턴(SWE)** 뒤에 숨김:
+```python
+class OutputType(str, Enum):
+    delta_lake = 'delta'
+    csv = 'csv'
+
+parser = argparse.ArgumentParser(prog='...')
+parser.add_argument('--output_type', required=True, type=OutputType)
+args = parser.parse_args()
+
+output_generation_factory = OutputGenerationFactory(args.output_type)   # 조건을 인터페이스 뒤로 은닉
+spark_session = output_generation_factory.get_spark_session()
+raw_data = (spark_session.read...)
+output_generation_factory.write_devices_data(raw_data, args.output_dir)
+```
+
+Factory 본문(Example 6-19) — 클라이언트는 `output_type` 만 넘기고, **분기는 전부 Factory 안에** 숨김:
+```python
+class OutputGenerationFactory:
+    def __init__(self, output_type: OutputType):
+        self.type = output_type
+
+    def get_spark_session(self) -> SparkSession:
+        if self.type == OutputType.delta_lake:              # Delta 면 delta-pip 로 세션 구성
+            return configure_spark_with_delta_pip(SparkSession...)
+        else:
+            return SparkSession.builder...getOrCreate()
+
+    def write_devices_data(self, devices_data: DataFrame, output_location: str):
+        if self.type == OutputType.delta_lake:
+            devices_data.write.format('delta')...            # Delta 브랜치
+        else:
+            devices_data.coalesce(1).write...format('csv')...  # CSV 브랜치
+```
+
+```
+[Factory 로 조건 은닉 — if-else 를 클라이언트에서 걷어냄]
+──────────────────────────────────────────────────────────────────────
+ 클라이언트 코드          OutputGenerationFactory (인터페이스)      실제 구현
+ --output_type=delta ─►  get_spark_session() / write_devices_data() ─┬─► Delta 로직
+                         (내부에서 self.type 으로 분기)               └─► CSV 로직
+──────────────────────────────────────────────────────────────────────
+ ⚠ 남은 약점 — 위처럼 두 메서드가 각자 if-else 를 반복. 메서드가 늘면 조건이 곳곳에 흩어짐.
+ ✓ 더 나아가려면 — Delta 전용·CSV 전용 "클래스" 를 Factory 가 통째로 돌려줘, 조건 자체를 1회로.
+```
+
+**예시 4 — 스키마 변화 기반 (Example 6-20)**
+
+외부 파라미터 대신 **데이터셋 특성(스키마)** 으로 경로를 정할 수도 있음:
+```python
+input_schema = detect_schema(input_dataset)
+output_location = DemoConfiguration.DEVICES_TABLE_LEGACY
+if len(input_schema.fields) >= 3:
+    output_location = DemoConfiguration.DEVICES_TABLE_SCHEMA_CHANGED
+```
+
+> 필드가 3개 이상이면 새 위치, 아니면 레거시 테이블로. **메타데이터 레이어(스키마)** 로 판단해 빠름 —
+> 단 데이터 자체를 조건으로 쓰면(Heavy conditions) 더 비쌀 수 있음.
+
+> **트러블 로그** — Exclusive Choice 를 **데이터 처리 레이어의 `if-else` 로만** 숨겨 두면,
+> 몇 주 뒤 그 잡이 여러 결과 경로를 가진다는 사실을 잊고 디버깅·변경 때 엉뚱한 곳을 헤맴.
+>
+> **예 —** `write_devices_data()` 하나가 `output_type` 에 따라 Delta 테이블 또는 CSV 를 만드는데,
+> 오케스트레이션 그래프만 보면 태스크가 하나뿐이라 "왜 어떤 날은 CSV, 어떤 날은 Delta 가 생기지?" 를 코드를 열기 전엔 알 수 없음.
+> backfill 로 2024-01-01 이전을 재처리할 때 실수로 새 잡이 도는 사고로도 이어짐.
+>
+> **권장 —** 분기가 **데이터셋·출력 저장소를 바꾸는** 수준이면 처리 레이어에 숨기지 말고
+> **오케스트레이션 레이어의 branch operator** 로 드러내고, 조건은 가능한 한 **메타데이터 기반** 으로 둘 것.
+
+---
+
+## 4. 오케스트레이션 (Orchestration)
+
+지금까지는 개별 흐름을 내부·외부 의존성과 함께 **정적으로 조직** 했을 뿐 — 오케스트레이션 레이어 위에 놓인 정적 리소스에 가까웠음.
+마지막 패턴 패밀리에서 이들이 **데이터 처리 태스크를 실제로 돌리는 동적 컴포넌트** 가 됨.
+
+핵심 질문 — "선언한 파이프라인을 오케스트레이터가 **어떤 동시성(concurrency)으로 실행하나?**"
+
+- **#39 Single Runner** — 한 파이프라인의 실행이 **항상 하나뿐**(concurrency = 1). 증분·순차 처리에 필수.
+- **#40 Concurrent Runner** — **여럿을 병렬 실행**(concurrency > 1). 서로 독립적인 실행을 가속(예: backfill).
+
+```
+[6.4 Orchestration — 같은 파이프라인을 몇 개까지 동시에 돌리나]
+──────────────────────────────────────────────────────────────────────
+ #39 Single Runner      run1 ─► run2 ─► run3        (concurrency=1, 앞이 끝나야 뒤가 시작)
+ #40 Concurrent Runner  run1 ┐
+                        run2 ┼─ 동시 실행 (concurrency=N)
+                        run3 ┘
+──────────────────────────────────────────────────────────────────────
+ 순차성이 결과 정합성의 전제면 Single, 실행끼리 독립이면 Concurrent.
+```
+
+---
+
+### 4-1. 패턴 #39: 단일 실행기 (Single Runner)
+
+> 가장 보편적인 오케스트레이션 패턴. 보편적인 대신 **런타임 비용** 이 따름.
+
+#### 상황 (Problem)
+
+**책의 use case** — 세션화 파이프라인을 릴리스에 올리는 경우:
+
+- 최근 프로젝트에서 **Incremental Sessionizer 패턴(챕터 5)** 으로 세션화 파이프라인을 구현.
+- POC 였던 터라 오케스트레이션은 범위 밖 — 세션을 비즈니스 오너와 검증하려고 잡을 **수동으로 on-demand** 실행해 옴.
+- 이제 프로젝트가 릴리스 사이클에 들어가 데이터 오케스트레이션을 붙여야 함.
+- **결정적 제약**: 파이프라인 그래프는 있지만 **실행 방법** 이 없음. 그리고 세션화는 **증분 = 순차** 라 **동시에 둘 이상 돌리면 결과가 틀림**.
+
+#### 해결 (Solution)
+
+runner 가 필요. Single Runner 는 **주어진 파이프라인의 실행이 항상 하나** 임을 보장 → **Single Runner**.
+
+- **구현** — 데이터 흐름의 **동시성 수준(concurrency)을 설정**. Airflow·Azure Data Factory 는 concurrency 속성을 **1** 로 두면 됨.
+- **네이티브 지원이 없으면** — **Readiness Marker 패턴(챕터 2)** 으로 이전 실행 완료를 기다리게 구현.
+- **작은 함정** — 이 방식은 **미래 실행의 트리거 자체를 막지는 않음**. 모든 후속 실행이 앞선 실행 완료를 기다리며 **줄 서게** 됨.
+
+#### 고려사항 (Consequences)
+
+제한된 동시성은 논리적으로는 타당하지만, 파이프라인의 일상 운영에 중요한 영향을 줌.
+
+- **Backfilling (백필)**
+  - backfill 만 안 하면 제한된 동시성은 별문제 아님. 하지만 backfill 하면 순차성 때문에 **재처리가 매우 느림**.
+  - 완화가 어려움 — 단일 동시성은 **완화 불가한 비즈니스 요구**(병렬로 돌리면 결과가 틀림).
+  - 할 수 있는 건 — 매번 **전체 파이프라인을 backfill 해야 하는지** 재검토.
+    예: 처리 단계 + 적재 단계로 구성됐고 **설정만 바꿔 다른 위치에 적재만** 하면 되는 경우, 무거운 데이터 처리 단계를 건너뛸 수 있음.
+- **Latency (지연)**
+  - backfill 이 최악의 시나리오. 덜 심각한 건 **straggler**(일부 실행이 유독 느림).
+    예: 시간별 파이프라인이 전체 **30분** 이면 되던 게 최근 **1.5시간** 으로 늘면 데이터가 점점 지연되고,
+    **모든 다운스트림 컨슈머** 까지 그 지연을 떠안음.
+  - 확장 가능한 인프라라면 **컴퓨트 추가·처리 로직 개선** 으로 완화.
+
+```
+[Single Runner + straggler — 지연이 매시간 누적되는 원리 (스케줄: 매시 정각, concurrency=1)]
+──────────────────────────────────────────────────────────────────────
+ ✓ 정상 (처리 30분) — 다음 실행 전에 여유 30분, 지연 0
+   00:00 ▓▓▓ 00:30끝    01:00 ▓▓▓ 01:30끝    02:00 ▓▓▓ 02:30끝
+
+ ✗ 스트래글러 (처리 1.5시간) — 밀린 실행이 큐에서 대기하며 누적
+   00:00 예정·시작 ▓▓▓▓▓▓▓▓▓ 01:30끝
+   01:00 예정 → 01:30 시작 ▓▓▓▓▓▓▓▓▓ 03:00끝     (지연 30분)
+   02:00 예정 → 03:00 시작 ▓▓▓▓▓▓▓▓▓ 04:30끝     (지연 60분)
+   03:00 예정 → 04:30 시작 ▓▓▓▓▓▓▓▓▓ 06:00끝     (지연 90분 → 계속 누적)
+──────────────────────────────────────────────────────────────────────
+ ⚠ concurrency=1 이라 밀린 실행이 줄 서며 지연이 매시간 +30분씩 벌어짐 → 다운스트림까지 전파.
+ ✓ 처리 시간을 스케줄 간격(1h) 밑으로 되돌려야(컴퓨트↑/로직 개선) 누적이 멈춤.
+```
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Apache Airflow (Example 6-21)**
+
+`max_active_runs=1` 로 동시 실행을 1로 제한하고, `depends_on_past=True` 로 이전 실행 성공을 전제:
+```python
+with DAG('visits_trend_generator', max_active_runs=1, default_args={
+    'depends_on_past': True,
+    # ...
+}):
+    ...
+```
+
+> `max_active_runs=1` — 동시 실행 파이프라인 수를 1로 제한(순차성 보장).
+> `depends_on_past=True` — 각 태스크가 **이전 실행의 같은 태스크 성공** 을 전제. 이전 run 의 태스크 A 가 실패하면 이번 run 의 A 는 시작 안 함.
+
+- **클러스터 단위 제어** — AWS EMR 의 **`StepConcurrencyLevel`** 로 한 클러스터에서 병렬 실행할 잡 수를 정함.
+- **클라우드 함정** — Airflow 는 활성 run 이 있으면 새 run 을 **아예 스케줄 안 함**.
+  반면 **Azure Data Factory 는 만들어서 최대 100개까지 큐에 쌓음** — 큐가 차면 스케줄링이 **429("Too many requests")** 를 반환.
+
+| 도구 | concurrency=1 설정 | 초과 시 동작 |
+|---|---|---|
+| Apache Airflow | `max_active_runs=1` | 활성 run 있으면 **새 run 스케줄 안 함** |
+| Azure Data Factory | `Concurrency=1` | 나머지는 **최대 100개 큐** 에 적재, 초과 시 **429** |
+| AWS EMR | `StepConcurrencyLevel` | 클러스터 내 **병렬 잡 수** 를 제한 |
+
+> **트러블 로그** — 증분·순차가 전제인 파이프라인(세션화·상태 누적 등)을 동시성 제한 없이 두면,
+> 앞 실행이 늘어질 때 다음 실행이 겹쳐 떠서 **상태가 중복·유실** 됨.
+>
+> **예 —** Incremental Sessionizer 를 `max_active_runs` 기본값으로 돌리다가 한 배치가 1.5시간으로 늘어난 날,
+> 다음 시간 run 이 앞 run 종료 전에 시작돼 **같은 세션 윈도를 두 번 갱신** → 세션 카운트가 부풀려짐.
+>
+> **권장 —** 결과 정합성이 **순서에 의존** 하면 `max_active_runs=1` + `depends_on_past=True` 로 **단일 실행** 을 강제하고,
+> backfill 이 느린 건 "전체 재처리가 정말 필요한지" 를 먼저 따져 적재만 다시 하는 식으로 줄일 것.
+
+---
+
+### 4-2. 패턴 #40: 동시 실행기 (Concurrent Runner)
+
+> Single Runner 의 backfill·지연 문제를 푸는 다음 패턴. **동시성 제약을 완화** 하기만 하면 됨.
+
+#### 상황 (Problem)
+
+**책의 use case** — 외부 소스를 최대한 빨리 적재해야 하는 데이터 수집 팀:
+
+- 데이터 수집 팀. 목표는 외부 at-rest 소스 → 내부 DB 로 **가능한 한 빨리** 적재.
+- 수집 주기는 보통 30분~1시간인데 **가끔 전체 과정이 더 오래** 걸림. Single Runner 라서 그 사이 **모든 후속 배송이 지연**.
+- **결정적 제약**: 적재하는 데이터셋들이 **서로 독립** — 순차 실행이 꼭 필요한지 의문.
+
+#### 해결 (Solution)
+
+데이터셋이 독립이므로 **순서 무관하게, 완화된 동시성 제약** 으로 수집 가능 → **Concurrent Runner**.
+
+- **구현** — **동시성을 1보다 크게** 정의.
+- **"큰 힘엔 큰 책임"** — 인프라 맥락에서 **다른 파이프라인까지 고려한 균형** 이 필요.
+- **동작** — 오케스트레이터가 현재 실행 중 인스턴스가 **최대 동시성에 못 미치는 한** 다음 실행을 계속 집어감.
+
+#### 고려사항 (Consequences)
+
+여러 파이프라인을 동시에 돌리는 것은 중요한 영향을 줄 수 있고, 특히 동시성 수준이 지나치게 관대할 때 그러함.
+
+- **Resource starvation (자원 고갈)**
+  - **멀티테넌트 환경**(여러 팀이 한 오케스트레이터 공유)에서 특히. 여러 파이프라인이 높은 동시성으로 동시에 backfill 하면
+    스케줄러가 **다른 파이프라인을 시작할 용량이 없음**.
+  - 최선책 — **workload management** 로 동시성 제어: 사용자 그룹에 특정 컴퓨트 용량을 할당 →
+    팀이 동시성을 아무리 높여도 **할당 임계값 이상은 못 씀**.
+  - 서버리스 오케스트레이터는 대체로 문제 아님 — 예: AWS Step Functions 는 최대 **10,000개** 병렬 자식 워크플로 허용.
+- **Shared state (공유 상태)**
+  - 동시 실행이 가능한 모든 것의 흔한 함정. 파이프라인이 **공유 컴포넌트** 에 작업하면,
+    동시·비결정적 실행이 예기치 못한 side effect 로 문제를 일으킴.
+  - 예: **Dynamic Late Data Integrator 패턴(챕터 4)** — 동시 실행이 잘돼야 backfill 을 여러 번 트리거,
+    최악이면 **일부 실행 날짜에 아예 트리거 안 됨**.
+
+```
+[Concurrent Runner + 공유 상태 — 두 run 이 같은 버전을 읽어 생기는 race condition]
+──────────────────────────────────────────────────────────────────────
+ 공유 state 테이블: last_processed_version = 100   (max_active_runs=5 로 run#1·#2 동시 시작)
+
+   run#1  read last=100 ─► v101~v110 처리 ─► write last=110
+   run#2  read last=100 ─► v101~v110 처리 ─► write last=110   ← run#1 과 똑같은 구간!
+          (run#1 이 쓰기 전에 100 을 읽어 버림)
+──────────────────────────────────────────────────────────────────────
+ ✗ v101~v110 이 두 번 적재(중복) · v111~ 는 아무도 안 집어 감(누락)
+ ⚠ 실행 타이밍에 따라 중복·누락 구간이 매번 달라짐 → 재현·디버깅이 어려움(비결정적)
+ ✓ 순서가 정합성의 전제면 Single Runner(=1) 유지. 굳이 병렬이면 파티션별로 상태를 쪼개 공유 자체를 없앰.
+```
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Apache Airflow (Example 6-22)**
+
+`max_active_runs=5` 로 동시 실행을 허용하고, 독립적이므로 `depends_on_past=False`:
+```python
+with DAG('devices_loader', max_active_runs=5, default_args={
+    'depends_on_past': False,
+    # ...
+}):
+    ...
+```
+
+> `max_active_runs=5` — 최대 5개 run 동시 실행. `depends_on_past=False` — 이전 실행에 의존하지 않음(독립 데이터셋이라 가능).
+> 특정 태스크만 이전 실행에 의존시키려면 `True` 로 바꿀 수 있고, 이는 **동시성 설정과 무관** 하지만 이전 실행이 실패한 태스크에서 파이프라인이 멈추게 할 수 있음.
+> 이 유연성은 모든 오케스트레이터에 있는 건 아님 — Azure Data Factory 는 동시성과 **트리거 기반 의존** 은 되지만 **태스크 기반 의존** 은 안 됨.
+
+| 패턴 | concurrency | 언제 | 핵심 위험 |
+|---|---|---|---|
+| #39 Single Runner | 1 | 증분·순차(세션화, 상태 누적) | backfill 느림·지연이 다운스트림까지 전파 |
+| #40 Concurrent Runner | >1 | 실행끼리 **독립**(무관한 데이터셋 수집) | 자원 고갈(멀티테넌트)·공유 상태 side effect |
+
+> **트러블 로그** — 독립이라 믿고 Concurrent Runner 로 동시성을 높였는데, 실은 파이프라인이 **공유 상태(state 테이블 등)** 를 건드리면
+> 동시 실행이 서로의 결과를 덮어써 데이터가 조용히 틀어짐.
+>
+> **예 —** 챕터 4 Dynamic Late Data Integrator 처럼 `last_processed_version` 을 공유하는 잡을 `max_active_runs=5` 로 돌리면,
+> 두 run 이 같은 버전을 읽고 각자 갱신해 어떤 날짜는 backfill 이 **중복 트리거**, 어떤 날짜는 **누락** 됨.
+>
+> **권장 —** 동시성을 1보다 올리기 전에 파이프라인이 **공유 컴포넌트에 쓰는지** 먼저 확인하고,
+> 순차성이 결과 정합성의 전제라면 **Single Runner(concurrency = 1)** 를 유지할 것. 멀티테넌트면 **workload management** 로 팀별 용량을 캡.
+
+---
+
+## 5. 요약
+
+챕터 6의 데이터 흐름 패턴은 **"만든 데이터 가치를 어떻게 잇고(sequence)·합치고(fan-in)·나누고(fan-out)·돌리나(orchestration)"** 를 다룸.
+#33(Local Sequencer)이 **한 파이프라인 안의 순서** 였다면, #34~#38 은 **파이프라인·팀 경계를 넘는 흐름** 을,
+#39~#40 은 그 흐름을 **어떤 동시성으로 실행할지** 를 조율함.
 
 | 패턴 | 카테고리 | 한 줄 요약 | 핵심 트레이드오프 |
 |---|---|---|---|
+| #33 Local Sequencer | Sequence | 거대 잡을 순서 있는 작은 태스크로 분해(같은 파이프라인 안) | 재시작·backfill 경계 설정 / 격리된 단일 잡엔 오케스트레이터가 과함 |
 | #34 Isolated Sequencer | Sequence | 조직·팀 경계로 분리된 두 파이프라인을 데이터/태스크 트리거로 연결 | 데이터 기반=느슨(진화 자유) / 태스크 기반=강결합(이름 변경에 취약)·팀 간 소통 의존 |
 | #35 Aligned Fan-In | Fan-In | 여러 부모(시간별 부분 집계)가 **모두 성공** 해야 자식(일별 최종) 실행 | backfill·피드백 루프 유리 / 인프라 스파이크·스케줄링 스큐 |
 | #36 Unaligned Fan-In | Fan-In | 일부 부모가 실패해도 자식 실행 — **부분 데이터** 허용 또는 실패 태스크 트리거 | 가독성 저하·완전성(completeness) 공유 필수 |
 | #37 Parallel Split | Fan-Out | 한 부모 → 둘 이상 자식 **병렬 실행**(같은 입력, 다른 처리) | 공통 계산 1회 물질화·재시도 이중 쓰기 방지 / 가장 느린 브랜치가 전체를 막음·HW 요구 불일치 |
+| #38 Exclusive Choice | Fan-Out | 조건 평가 후 여러 자식 중 **하나만** 실행(if-else/branch) | 분기 남발 시 가독성 급락·처리 레이어의 숨은 로직 / 메타데이터 조건 선호 |
+| #39 Single Runner | Orchestration | 파이프라인 실행이 **항상 하나**(concurrency = 1) | 증분·순차엔 필수 / backfill 느림·지연이 다운스트림까지 전파 |
+| #40 Concurrent Runner | Orchestration | 여럿 **병렬 실행**(concurrency > 1) | 독립 실행 가속(backfill) / 자원 고갈(멀티테넌트)·공유 상태 side effect |
 
 ```
-[#34 ~ #37 한눈에 — 시퀀스에서 팬인·팬아웃으로]
+[#33 ~ #40 한눈에 — 시퀀스 → 팬인 → 팬아웃 → 오케스트레이션]
 ──────────────────────────────────────────────────────────────────────
- Sequence   provider ──(데이터/태스크 트리거)──► consumer     #34 Isolated Sequencer
+ Sequence   task A ─► task B ─► task C                       #33 Local Sequencer
+            provider ──(데이터/태스크 트리거)──► consumer     #34 Isolated Sequencer
  Fan-In     h1·h2·…·h24 ──► (merge) ──► final                #35 Aligned  (모두 성공)
                         └─► partial(+실패 갈래)                #36 Unaligned(일부 성공)
- Fan-Out    parent ──┬─► child A                             #37 Parallel Split
-                     └─► child B                             (병렬, 같은 부모)
+ Fan-Out    parent ──┬─► child A (병렬 전부)                  #37 Parallel Split
+                     └─► child B
+            parent ─► 조건? ─┬─► child A (택일)               #38 Exclusive Choice
+                            └─► child B
+ Orchestr.  run1 ─► run2 ─► run3       (concurrency=1)        #39 Single Runner
+            run1·run2·run3 동시 실행   (concurrency=N)        #40 Concurrent Runner
 ──────────────────────────────────────────────────────────────────────
  공통 원칙 — 경계(boundary)는 "재시작 단위·backfill 단위" 로 잡고, 팀 경계를 넘을수록 소통·완전성 공유가 핵심.
 ```
 
 **정리** — 팬인은 **"모두 기다릴지(Aligned)"** vs **"부분이라도 갈지(Unaligned)"** 의 선택이고,
-그 선택의 대가는 각각 **지연(스큐)** 과 **완전성 관리 부담**. 팬아웃은 **같은 입력을 여러 갈래로** 쓰되
-**공통 계산을 한 번만** 하고 **재시도 중복 쓰기** 를 막는 것이 관건.
-후속 문서에서 **#38 Exclusive Choice**(조건 분기)와 **6.4 Orchestration**(#39 Single / #40 Concurrent Runner, 파이프라인 동시성)을 다룸.
+그 대가는 각각 **지연(스큐)** 과 **완전성 관리 부담**. 팬아웃은 **모두 병렬로(Parallel Split)** vs **하나만 택일(Exclusive Choice)** 의 선택이고,
+그 관건은 각각 **공통 계산 1회·중복 쓰기 방지** 와 **분기를 오케스트레이션 레이어로 드러내기**.
+마지막 오케스트레이션은 **동시성 1(Single)** 로 순서를 지킬지 **동시성 N(Concurrent)** 으로 처리량을 올릴지의 선택 —
+실행끼리 **독립인지, 공유 상태를 건드리는지** 가 갈림길.
+다음 챕터(7 데이터 보안)에서는 이렇게 만든 데이터셋을 **어떻게 지우고·접근 제어하고·보호하나** 로 넘어감.
