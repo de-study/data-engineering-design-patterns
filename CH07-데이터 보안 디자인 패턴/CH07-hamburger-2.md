@@ -120,3 +120,141 @@ pseud_anonymized_users = (
              ELSE "60000+" END'''))
 )
 ```
+
+데이터를 보호하는 것만으로는 충분하지 않다. 데이터는 동일한 시스템 내 또는 서로 다른 시스템 간에 지속적으로 흐르며, 시스템은 이 데이터에 지속적으로 접근해야 한다. 따라서 안전한 연결을 보장하기 위한 보안 접근 전략이 필수적이다.
+
+## 패턴 #48: 비밀 포인터 (Secrets Pointer)
+
+### 1\. 문제 정의
+
+-   **사용 사례**: 방문 실시간 처리 파이프라인에서 각 이벤트에 지리적 위치 정보를 추가(풍부화)하기 위해 외부 API를 활용한다. 해당 API의 유일한 인증 방식은 로그인/패스워드 쌍이다.
+-   **발생했던 문제**: 과거 팀에서 실수로 다른 API에 사용되는 로그인/패스워드를 공유하는 사고가 발생했다. API가 요청별로 과금되는 방식이었기 때문에 유출로 인한 청구 금액이 크게 증가했다.
+-   **목표**: 새로운 데이터 풍부화 API와 상호작용하는 코드에 로그인/패스워드를 직접 저장하는 위험을 피하고자 한다.
+
+### 2\. 해결책 및 작동 방식
+
+자격 증명(Credentials)은 민감한 매개변수이다. 가장 좋은 보안 방법은 자격 증명을 코드나 파일 어디에도 직접 저장하지 않고 참조(포인터)를 사용하는 것이다.
+
+-   **비밀 관리자(Secrets Manager) 서비스 활용**: 구글 클라우드 Secret Manager나 AWS Secrets Manager와 같은 중앙 관리 서비스를 활용하여 로그인, 패스워드, API 키 등의 민감한 값을 저장한다.
+-   **장점**:
+    1.  **접근 모니터링 용이**: 중앙화된 장소에서 민감 데이터를 관리하므로 접근 제어 및 모니터링이 쉬워진다.
+    2.  **구성 요소 관리 용이**: 컨슈머를 일일이 수정할 필요 없이 관리자 서비스에서 새로운 자격 증명 셋을 쉽게 설정할 수 있다.
+    3.  **환경별 관리 간소화**: 테라폼(Terraform)과 같은 IaC(Code로서의 인프라) 스택 이용 시 모든 환경(개발, 검증, 운영 등)에서 동일한 비밀 이름을 유지할 수 있어 환경별 매개변수를 다루는 복잡함이 줄어든다.
+-   **접근 보호의 2가지 수준**:
+    -   **1단계**: 컨슈머가 비밀 관리자 서비스 자체에 접근할 수 있는지 권한을 검증한다.
+    -   **2단계**: 검색된 자격 증명 자체를 통해 대상 API나 데이터베이스 접근 가능 여부를 보장한다.
+
+### 3\. 결과 및 고려사항 (트레이드오프)
+
+-   **캐싱 무효화(Cache Invalidation) 문제**:
+    -   통신 비용을 줄이고 실행 시간을 최적화하기 위해 자격 증명을 로컬에 캐싱할 수 있다.
+    -   다만 자격 증명이 새로 고쳐졌을 때 캐시가 무효화되지 않으면 연결 오류가 발생한다.
+    -   가장 간단한 해결책은 자격 증명 변경 시 작업이 실패하도록 두고, 재시작 시 새 자격 증명을 비밀 관리자에서 다시 로드하게 만드는 것이다. (단, 실패가 잦아질 수 있으므로 재시도 시에도 데이터 올바름을 유지하는 **멱등성 디자인 패턴**을 함께 고려해야 한다.)
+    -   비동기 새로 고침 프로세스를 사용하는 경우에도 매개변수를 바꾸기 전에 데이터를 쓰기 시작하면 출력 데이터 스토어 쓰기 오류가 발생할 수 있다.
+-   **잘못된 보안 인식 및 로그 유출 위험**:
+    -   비밀 관리자에 저장했다고 해서 안전하다는 착각을 하면 안 된다. 실수로 애플리케이션 로그에 자격 증명을 출력하도록 작성하면 여전히 비밀이 유출될 수 있다.
+-   **비밀 생성 주체의 필요성**:
+    -   컨슈머가 비밀을 직접 다루지 않더라도, 비밀 저장소에 비밀 값을 최초로 안전하게 생성해 넣는 주체(사람 관리자 또는 IaC 스택)가 반드시 필요하다.
+
+### 4\. 예제 (PySpark)
+
+코드 내에 평문 자격 증명을 넣지 않고, boto3를 통해 AWS Secrets Manager에서 자격 증명을 불러와 PostgreSQL 데이터베이스에 연결하는 예제이다.
+
+```
+# 예제 7-27: 평문 자격 증명 없이 아파치 스파크에서 PostgreSQL로의 데이터베이스 연결
+secretsmanager_client = boto3.client('secretsmanager')
+
+# 비밀 관리자에서 user와 pwd 값을 검색
+db_user = secretsmanager_client.get_secret_value(SecretId='user')['SecretString']
+db_password = secretsmanager_client.get_secret_value(SecretId='pwd')['SecretString']
+
+# 가져온 참조 값을 이용해 JDBC 연결
+spark_session.read.option('driver', 'org.postgresql.Driver').jdbc(
+    url='jdbc:postgresql:dedp', 
+    table='dedp.devices',
+    properties={'user': db_user, 'password': db_password}
+)
+```
+
+이 방식은 여전히 코드상에서 db\_user와 db\_password를 참조하지만, 실제 값은 코드베이스에 포함되지 않고 별도의 자산으로 비밀 관리자에서 안전하게 관리된다.
+
+## 패턴 #49: 비밀 없는 커넥터 (Secretless Connector)
+
+### 1\. 문제 정의
+
+-   **사용 사례**: 새로운 데이터 처리 서비스를 통합하려는 팀이 클라우드 관리 자원과 상호작용하기 위해 API 키를 사용하는 코드 예제들을 확인했다.
+-   **목표**: 팀은 이러한 API 키조차도 관리하고 싶지 않으며, 코드에서 어떠한 종류의 자격 증명도 참조하지 않고 클라우드 자원에 접근하기를 원한다.
+
+### 2\. 해결책 및 구현 방식
+
+비밀 없는 커넥터 패턴은 애플리케이션 코드에 관리해야 할 자격 증명을 전혀 두지 않는 방식이다. 대표적으로 2가지 주요 접근 방식이 있다.
+
+1.  **IAM 기반 정책 접근 (IAM-based Policy Access)**
+    -   클라우드 제공업체의 IAM(Identity and Access Management) 서비스를 사용한다.
+    -   사용자, 그룹 또는 역할(Role)에 문서 형태로 읽기/쓰기 접근 정책을 할당하여 제어한다.
+    -   물리적 사용자뿐만 아니라 자동화되어 실행되는 데이터 처리 작업(애플리케이션 사용자)에도 동일하게 적용된다.
+2.  **인증서 기반 인증 (Certificate-based Authentication)**
+    -   IAM 서비스 대신 인증 기관(CA, Certificate Authority)을 활용한다.
+    -   연결 프로세스에서 사용되는 인증서를 검증하여 작업에 필요한 권한을 부여한다.
+
+### 3\. IAM 기반 자격 증명 없는 접근 워크플로 (4단계)
+
+1.  **요청 발행**: 애플리케이션 사용자(데이터 처리 잡)가 클라우드 서비스(예: 객체 스토어)에 읽기 등의 요청을 발행한다.
+2.  **권한 검증 요청**: 서비스는 객체를 즉시 반환하지 않고, IAM 서비스에 연결하여 해당 사용자가 요청을 충족할 권한이 있는지 검증한다.
+3.  **권한 전달**: IAM 서비스가 해당 클라우드 서비스에 권한 범위 목록을 전달한다.
+4.  **응답 반환**: 필요한 권한이 모두 충족되면 클라우드 서비스가 사용자에게 요청한 데이터를 반환하며, 권한이 없으면 오류를 반환한다.
+
+### 4\. 결과 및 고려사항 (트레이드오프)
+
+-   **초기 구성 수고 발생**: 'Secretless'라고 해서 아무런 작업이 필요 없는 것은 아니다. AWS의 경우 다른 서비스와 상호작용할 수 있도록 STS(보안 토큰 서비스)에서 반환하는 임시 자격 증명을 이용하기 위한 역할 가정(Role Assumption) 권한 설정 등의 작업을 거쳐야 한다.
+-   **인증서 교체(Rotation) 오버헤드**:
+    -   보안을 위해 인증서나 접근 키를 정기적으로 교체할 때 추가적인 관리 비용이 발생한다.
+    -   기존 컨슈머의 서비스 중단을 방지하려면 **새 자격 증명 생성 $\\rightarrow$ 공유 $\\rightarrow$ 구/신 자격 증명 동시 지원 $\\rightarrow$ 컨슈머 이동 확인 $\\rightarrow$ 기존 자격 증명 삭제** 순서의 체계적인 교체 프로세스를 거쳐야 한다.
+
+### 5\. 예제
+
+#### 예제 1: PySpark에서 PostgreSQL 인증서 기반 연결
+
+패스워드를 매개변수로 넘기지 않고, SSL 인증서를 검증하는 로직을 통해 데이터베이스에 연결한다.
+
+```
+# 예제 7-28: 아파치 스파크에서 PostgreSQL로의 인증서 기반 연결
+input_data = spark.read.option('driver', 'org.postgresql.Driver').jdbc(
+    url='jdbc:postgresql:dedp',
+    table='dedp.devices',
+    properties={
+        'ssl': 'true',
+        'sslmode': 'verify-full', # 서버 호스트 이름과 인증서 저장 이름의 일치 여부 검증
+        'user': 'dedp_test',
+        'sslrootcert': 'dataset/certs/ssl-cert-snakeoil.pem'
+    }
+)
+```
+
+#### 예제 2: GCP Dataflow & GCS IAM 연동 (Terraform HCL)
+
+GCP 환경에서 Dataflow 작업에 서비스 계정(Service Account)을 생성하고 IAM 권한을 부여하여, 자격 증명 없이 GCS 버킷에 접근하도록 설정하는 예제이다.
+
+```
+# 예제 7-29: GCP에서 서비스 계정(Service Account) 생성
+resource "google_service_account" "visits_job_sa" {
+  account_id   = "dedp"
+  display_name = "Dataflow SA for processing visits from GCS"
+}
+
+# 예제 7-30: Visits 버킷에 읽기 권한 할당 및 Dataflow 잡에 연결
+resource "google_storage_bucket_iam_binding" "visits_access" {
+  bucket  = "visits"
+  role    = "roles/storage.objectViewer"
+  members = [
+    "serviceAccount:${google_service_account.visits_job_sa.email}"
+  ]
+}
+
+resource "google_dataflow_job" "visits_aggregator" {
+  # ... (기타 설정)
+  service_account_email = google_service_account.visits_job_sa.email
+}
+```
+
+이렇게 서비스 계정을 통해 visits\_aggregator 잡에 아이덴티티를 부여하면, 런타임에 별도의 자격 증명(패스워드나 키)을 코드에 보관할 필요 없이 visits 버킷을 조회할 수 있다.
